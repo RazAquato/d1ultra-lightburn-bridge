@@ -9,7 +9,7 @@ A translation bridge that lets [LightBurn](https://lightburnsoftware.com/) contr
 The D1 Ultra uses a proprietary binary protocol over TCP — not GRBL. This bridge translates between the two:
 
 ```
-LightBurn  --GRBL/TCP-->  v2.py (localhost:9023)  --D1 Ultra/TCP-->  Laser (192.168.12.1:6000)
+LightBurn  --GRBL/TCP-->  d1ultra-bridge.py (localhost:9023)  --D1 Ultra/TCP-->  Laser (192.168.12.1:6000)
 ```
 
 ---
@@ -59,7 +59,7 @@ If the adapter doesn't get an IP, unplug and replug the USB cable.
 ### 2. Start the bridge
 
 ```
-python v2.py --listen-port 9023
+python d1ultra-bridge.py --listen-port 9023
 ```
 
 ### 3. Set up LightBurn
@@ -100,8 +100,7 @@ Design your job in LightBurn, set power/speed in the Cuts/Layers panel, and hit 
 ## Project Structure
 
 ```
-v2.py                      Current bridge (v2.3 — confirmed working)
-d1ultra_bridge.py          Original v1 bridge (historical reference)
+d1ultra-bridge.py          Current bridge (v2.3 — confirmed working)
 PROTOCOL.md                Full D1 Ultra binary protocol specification
 CLAUDE.md                  Development log and remaining investigation notes
 captures/                  26 stripped pcapng files from M+ sessions
@@ -154,7 +153,7 @@ LightBurn console commands also work: `$FOCUS`, `$FOCUS OFF`, `$AUTOFOCUS`/`$AF`
 ## Command-Line Options
 
 ```
-python v2.py [options]
+python d1ultra-bridge.py [options]
 
   --laser-ip IP       D1 Ultra IP (default: 192.168.12.1)
   --laser-port PORT   D1 Ultra TCP port (default: 6000)
@@ -169,7 +168,7 @@ python v2.py [options]
 To verify that M+'s exact bytes trigger the laser:
 
 ```
-python v2.py --replay captures/svg_from_m+.pcapng
+python d1ultra-bridge.py --replay captures/svg_from_m+.pcapng
 ```
 
 ---
