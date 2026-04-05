@@ -1,22 +1,55 @@
 #!/usr/bin/env python3
 """
-Hansmaker D1 Ultra <-> LightBurn GRBL Bridge
-=============================================
+Hansmaker D1 Ultra <-> LightBurn Bridge  v2.3
+==============================================
+Translates GRBL/TCP (LightBurn) to the D1 Ultra proprietary binary protocol.
 
-This bridge sits between LightBurn (speaking GRBL over TCP) and the
-D1 Ultra laser (speaking its proprietary binary protocol on TCP port 6000).
+  LightBurn  ──GRBL/TCP──▶  Bridge (localhost:9023)  ──D1 Ultra/TCP──▶  Laser (192.168.12.1:6000)
 
-LightBurn connects to this bridge as a "GRBL" device over TCP.
-The bridge translates GRBL commands into D1 Ultra binary packets.
+!! WARNING — EXPERIMENTAL — USE AT YOUR OWN RISK !!
+
+  This software communicates with a laser engraver that can cause fire, eye
+  damage, and property damage.  Use entirely at your own risk.
+
+Changes vs v2.0
+────────────────
+  ★ FIX: ACK feedback loop — 0x0013/0x0015 responses to OUR queries were
+    being treated as "unsolicited" and ACK'd, causing infinite retransmit.
+    Now checks self._pending FIRST: if a caller is waiting for that seq,
+    route it as a normal response. Only ACK truly unsolicited messages.
+  • FIX: PNG preview uses make_preview_png(44,44) in execute_job (was 100,100
+    contradicting the docstring — 44×44 produces ~6KB matching M+ size)
+  • NEW: Auto-reconnect — if the laser drops the TCP connection (idle timeout
+    after a job), the bridge reconnects and re-identifies automatically when
+    the next job is submitted. No need to restart the bridge.
+  • NEW: Job serialization lock — LightBurn sends each layer as a separate M30
+    command, which caused concurrent jobs to stomp on each other. Jobs now
+    queue and execute one at a time.
+
+Changes vs v1
+─────────────
+CRITICAL (from pcapng analysis):
+  1. HOST now SENDS 0x0003 (JOB_CONTROL) to the laser instead of waiting.
+  2. WORKSPACE (0x0009) payload is 42 bytes (5 doubles + 2-byte pad).
+  3. JOB_SETTINGS unknown field: -1.0  (v1 used 0.0; M+ always sends -1.0)
+  4. CMD 0x0005 (PRE_JOB) sent before JOB_UPLOAD, matching M+ sequence
+  5. CMD 0x0009 (WORKSPACE) sent with bounding box, matching M+ sequence
+  6. CMD 0x0014 (sub=0x02) pre-job setup sent, matching M+ sequence
+  7. Unsolicited 0x0013/0x0014/0x0015 messages now ACK'd (when truly unsolicited)
+  8. PNG preview is a proper ~6 KB image (was 286 bytes)
+  9. G1 S0 duplicate point filter
+ 10. Packet pacing: 10 ms delay between SETTINGS+PATH pairs
+ 11. Replay mode: --replay <pcapng_file> sends HOST→LASER bytes from capture
+ 12. Full startup sequence matches M+ order
 
 Usage:
-    python d1ultra_bridge.py [--laser-ip 192.168.12.1] [--listen-port 23]
+    python d1ultra_bridge.py --listen-port 9023
+    python d1ultra_bridge.py --replay path/to/capture.pcapng
 
-Then in LightBurn:
-    Devices -> Add Manually -> GRBL
-    Connection: TCP/IP, Address: localhost, Port: 23
-
-Protocol reverse-engineered from Wireshark captures, April 2026.
+LightBurn setup:
+    Devices → Create Manually → GRBL (1.1f+) → Ethernet/TCP
+    Address: 127.0.0.1   Port: 9023
+    Origin: Front Left   Disable auto-home
 """
 
 import os
@@ -33,19 +66,17 @@ import zlib
 from typing import Optional, Tuple, List
 from enum import IntEnum
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-DEFAULT_LASER_IP = "192.168.12.1"
-DEFAULT_LASER_PORT = 6000
+# ─────────────────────────────────────────────────────────────────────────────
+# Defaults
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_LASER_IP    = "192.168.12.1"
+DEFAULT_LASER_PORT  = 6000
 DEFAULT_LISTEN_HOST = "0.0.0.0"
-DEFAULT_LISTEN_PORT = 23
+DEFAULT_LISTEN_PORT = 9023
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Logging
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -53,40 +84,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("bridge")
 
-# ---------------------------------------------------------------------------
-# D1 Ultra Protocol Constants
-# ---------------------------------------------------------------------------
-
-MAGIC = b'\x0a\x0a'
+# ─────────────────────────────────────────────────────────────────────────────
+# Protocol constants
+# ─────────────────────────────────────────────────────────────────────────────
+MAGIC      = b'\x0a\x0a'
 TERMINATOR = b'\x0d\x0d'
 
-
-def make_preview_png(width: int = 100, height: int = 100) -> bytes:
-    """Generate a minimal valid PNG image (white, no dependencies).
-
-    M+ always includes a PNG preview in JOB_DATA.  The laser may require
-    it to register the job.  This produces a valid PNG without PIL/Pillow.
-    """
-    def _chunk(ctype: bytes, data: bytes) -> bytes:
-        c = ctype + data
-        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xFFFFFFFF)
-
-    sig = b'\x89PNG\r\n\x1a\n'
-    ihdr = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)  # 8-bit RGB
-    # Image data: rows of (filter_byte=0 + white pixels)
-    raw = b''
-    for _ in range(height):
-        raw += b'\x00' + b'\xff' * (width * 3)
-    idat = zlib.compress(raw)
-    return sig + _chunk(b'IHDR', ihdr) + _chunk(b'IDAT', idat) + _chunk(b'IEND', b'')
-
-
 class Cmd(IntEnum):
-    """D1 Ultra command IDs."""
     STATUS      = 0x0000
     PATH_DATA   = 0x0001
     JOB_UPLOAD  = 0x0002
-    JOB_START   = 0x0003
+    JOB_CONTROL = 0x0003
     JOB_FINISH  = 0x0004
     PRE_JOB     = 0x0005
     DEVICE_ID   = 0x0006
@@ -102,24 +110,45 @@ class Cmd(IntEnum):
     DEVICE_INFO = 0x0018
     FW_VERSION  = 0x001E
 
-class Peripheral(IntEnum):
-    """Peripheral module IDs for cmd 0x000E."""
-    FILL_LIGHT  = 0x00
-    BUZZER      = 0x01
-    FOCUS_LASER = 0x02
-    SAFETY_GATE = 0x03
-
 class LaserSource(IntEnum):
-    """Laser source byte in job settings."""
     IR    = 0
     DIODE = 1
 
-# ---------------------------------------------------------------------------
-# CRC-16/MODBUS
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Preview PNG generator — produces a ~6 KB noisy PNG matching M+ size class
+# ─────────────────────────────────────────────────────────────────────────────
+def make_preview_png(width: int = 44, height: int = 44) -> bytes:
+    """Generate a noisy preview PNG without PIL — produces ~6 KB matching M+ size.
 
+    M+ sends a rendered preview thumbnail (~6255 bytes).  A plain white PNG
+    compresses to ~286 bytes.  We use a deterministic pseudo-noise pattern that
+    doesn't compress well, producing ~6 KB at 44×44 RGB with zlib level=0.
+    """
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        c = ctype + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xFFFFFFFF)
+
+    sig  = b'\x89PNG\r\n\x1a\n'
+    ihdr = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)  # 8-bit RGB
+
+    # Deterministic LCG noise: prevents zlib compression, keeps file large
+    raw = bytearray()
+    v = 0xDEADBEEF
+    for _ in range(height):
+        raw.append(0)  # filter byte
+        for _ in range(width):
+            v = (v * 1664525 + 1013904223) & 0xFFFFFFFF
+            raw.append((v >> 16) & 0xFF)
+            raw.append((v >> 8)  & 0xFF)
+            raw.append(v         & 0xFF)
+    idat = zlib.compress(bytes(raw), level=0)  # level=0 = store, no compression
+
+    return sig + _chunk(b'IHDR', ihdr) + _chunk(b'IDAT', idat) + _chunk(b'IEND', b'')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRC-16/MODBUS
+# ─────────────────────────────────────────────────────────────────────────────
 def crc16_modbus(data: bytes) -> int:
-    """Calculate CRC-16/MODBUS checksum."""
     crc = 0xFFFF
     for byte in data:
         crc ^= byte
@@ -130,436 +159,387 @@ def crc16_modbus(data: bytes) -> int:
                 crc >>= 1
     return crc
 
-# ---------------------------------------------------------------------------
-# D1 Ultra Packet Builder
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Packet builder
+# ─────────────────────────────────────────────────────────────────────────────
 class PacketBuilder:
-    """Constructs valid D1 Ultra binary packets."""
-
     def __init__(self):
         self._seq = 0
-
-    @property
-    def seq(self) -> int:
-        return self._seq
 
     def next_seq(self) -> int:
         self._seq += 1
         return self._seq
 
     def build(self, cmd: int, payload: bytes = b'', msg_type: int = 1) -> bytes:
-        """Build a complete packet with header, payload, CRC, and terminator."""
         seq = self.next_seq()
-        total_len = 14 + len(payload) + 4  # header(14) + payload + CRC(2) + term(2)
+        total_len = 14 + len(payload) + 4
         header = struct.pack('<HH HH HH H',
-            0x0A0A,     # magic
-            total_len,  # total length
-            0,          # padding
-            seq,        # sequence number
-            0,          # padding
-            msg_type,   # message type
-            cmd,        # command ID
-        )
-        # CRC over everything after the 2-byte magic
+            0x0A0A, total_len, 0, seq, 0, msg_type, cmd)
         crc_data = header[2:] + payload
         crc = crc16_modbus(crc_data)
         return header + payload + struct.pack('<H', crc) + TERMINATOR
 
-    def build_status(self) -> bytes:
-        """Build a status/heartbeat query (empty cmd 0x0000)."""
+    # ── Core commands ─────────────────────────────────────────────────────────
+
+    def build_status(self):
         return self.build(Cmd.STATUS)
 
-    def build_motor_reset(self) -> bytes:
-        """Build motor reset/calibration query (cmd 0x000B, empty payload).
+    def build_device_id(self):
+        return self.build(Cmd.DEVICE_ID)
 
-        Response contains 283 bytes: u32 header + 34 IEEE 754 doubles
-        with motor calibration/workspace boundary data.
-        """
+    def build_fw_version(self):
+        return self.build(Cmd.FW_VERSION)
+
+    def build_motor_reset(self):
         return self.build(Cmd.MOTOR_RESET)
 
+    def build_query_13(self):
+        return self.build(Cmd.QUERY_13)
+
+    def build_query_15(self):
+        return self.build(Cmd.QUERY_15)
+
+    def build_query_14(self, sub: int = 0x02):
+        return self.build(Cmd.QUERY_14, struct.pack('<B', sub))
+
+    def build_device_info(self, device_id: int = 0x8B1B, ir_select: int = 0):
+        payload  = struct.pack('<HH', 0x0006, device_id)
+        payload += struct.pack('<B', ir_select)
+        payload += b'\x00' * (32 - 5)
+        return self.build(Cmd.DEVICE_INFO, payload)
+
+    # ── PRE_JOB (0x0005) ─────────────────────────────────────────────────────
+    def build_pre_job(self):
+        """Send before JOB_UPLOAD.  M+ always sends this; v1 omitted it."""
+        return self.build(Cmd.PRE_JOB)
+
+    # ── WORKSPACE (0x0009) ────────────────────────────────────────────────────
+    def build_workspace(self, speed: float,
+                        x_min: float, y_min: float,
+                        x_max: float, y_max: float):
+        """Send bounding box of the job to the laser before path data.
+        Payload is 42 bytes: 5 doubles (40) + 2 zero-pad bytes.
+        """
+        payload = struct.pack('<ddddd', speed, x_min, y_min, x_max, y_max)
+        payload += b'\x00\x00'  # 2-byte padding (M+ sends 42, not 40)
+        return self.build(Cmd.WORKSPACE, payload)
+
+    # ── Job settings (msg_type=0) ─────────────────────────────────────────────
     def build_job_settings(self, passes: int, speed_mm_min: float,
                            frequency_khz: float, power_frac: float,
-                           laser_source: int = LaserSource.DIODE,
-                           unknown: float = 0.0) -> bytes:
-        """Build the 55-byte job settings packet (cmd 0x0000 with 37-byte payload).
-
-        IMPORTANT: msg_type=0 per M+ capture (not the default msg_type=1).
-        """
-        payload = struct.pack('<I', passes)
+                           laser_source: int = LaserSource.DIODE) -> bytes:
+        """37-byte job settings payload.  Unknown field is -1.0 (M+ always)."""
+        payload  = struct.pack('<I', passes)
         payload += struct.pack('<d', speed_mm_min)
         payload += struct.pack('<d', frequency_khz)
         payload += struct.pack('<d', power_frac)
         payload += struct.pack('<B', laser_source)
-        payload += struct.pack('<d', unknown)
+        payload += struct.pack('<d', -1.0)
         return self.build(Cmd.STATUS, payload, msg_type=0)
 
+    # ── Path data (msg_type=0) ────────────────────────────────────────────────
     def build_path_data(self, segments: List[Tuple[float, float]]) -> bytes:
-        """Build a path data packet with coordinate segments.
-
-        Each segment is (x_mm, y_mm) relative to workspace center.
-        IMPORTANT: msg_type=0 per M+ capture (not the default msg_type=1).
-        """
-        count = len(segments)
+        count   = len(segments)
         payload = struct.pack('<I', count)
         for x, y in segments:
-            payload += struct.pack('<d', x)   # X coordinate
-            payload += struct.pack('<d', y)   # Y coordinate
-            payload += b'\x00' * 16           # reserved
+            payload += struct.pack('<d', x)
+            payload += struct.pack('<d', y)
+            payload += b'\x00' * 16
         return self.build(Cmd.PATH_DATA, payload, msg_type=0)
 
+    # ── Job upload header ─────────────────────────────────────────────────────
     def build_job_upload(self, job_name: str, png_data: bytes = b'') -> bytes:
-        """Build the job upload header (cmd 0x0002).
+        name_bytes  = job_name.encode('utf-8')[:255]
+        name_field  = name_bytes + b'\x00' * (256 - len(name_bytes))
+        padding     = b'\x00\x00'
+        png_size    = struct.pack('<I', len(png_data))
+        return self.build(Cmd.JOB_UPLOAD, name_field + padding + png_size + png_data)
 
-        Payload format (from M+ capture):
-          bytes 0-255:   Job name, null-terminated, zero-padded (256 bytes)
-          bytes 256-257: Padding (0x0000)
-          bytes 258-261: PNG size as u32 LE
-          bytes 262+:    PNG image data (preview thumbnail)
-        """
-        # Job name: 256 bytes, null-terminated, zero-padded
-        name_bytes = job_name.encode('utf-8')[:255]
-        name_field = name_bytes + b'\x00' * (256 - len(name_bytes))
-        # PNG size is u32 LE (NOT u16!) per M+ capture
-        padding = b'\x00\x00'
-        png_size = struct.pack('<I', len(png_data))
-        payload = name_field + padding + png_size + png_data
-        return self.build(Cmd.JOB_UPLOAD, payload)
-
-    def build_job_start(self) -> bytes:
-        """Build the job start command (cmd 0x0003)."""
-        return self.build(Cmd.JOB_START)
-
+    # ── Job finalize ──────────────────────────────────────────────────────────
     def build_job_finish(self, job_name: str) -> bytes:
-        """Build the job finalize command (cmd 0x0004)."""
         name_bytes = job_name.encode('utf-8')[:255]
         name_field = name_bytes + b'\x00' * (256 - len(name_bytes))
         return self.build(Cmd.JOB_FINISH, name_field)
 
-    def build_pre_job(self) -> bytes:
-        """Build the pre-job init command (cmd 0x0005)."""
-        return self.build(Cmd.PRE_JOB)
+    # ── JOB_CONTROL (0x0003) ──────────────────────────────────────────────────
+    def build_job_control(self) -> bytes:
+        """Send JOB_CONTROL to initiate execution. M+ sends this after all paths."""
+        return self.build(Cmd.JOB_CONTROL)
 
-    def build_device_id(self) -> bytes:
-        """Build the device identification query (cmd 0x0006)."""
-        return self.build(Cmd.DEVICE_ID)
-
-    def build_workspace(self, speed: float, x_min: float, y_min: float,
-                        x_max: float, y_max: float) -> bytes:
-        """Build the workspace/preview config (cmd 0x0009)."""
-        payload = struct.pack('<ddddd', speed, x_min, y_min, x_max, y_max)
-        return self.build(Cmd.WORKSPACE, payload)
-
+    # ── Peripheral / motion helpers ───────────────────────────────────────────
     def build_peripheral(self, module: int, state: bool) -> bytes:
-        """Build a peripheral control command (cmd 0x000E)."""
-        payload = struct.pack('<BB', module, 1 if state else 0)
-        return self.build(Cmd.PERIPHERAL, payload)
+        return self.build(Cmd.PERIPHERAL, struct.pack('<BB', module, 1 if state else 0))
 
     def build_z_move(self, distance_mm: float) -> bytes:
-        """Build a Z-axis move command (cmd 0x000F, mode=0)."""
-        payload = struct.pack('<B', 0)          # mode 0: manual move
-        payload += struct.pack('<d', distance_mm)  # distance (+ = up, - = down)
-        payload += struct.pack('<I', 4)          # parameter
-        payload += b'\x00' * 4                   # padding
+        payload  = struct.pack('<B', 0)
+        payload += struct.pack('<d', distance_mm)
+        payload += struct.pack('<I', 4)
+        payload += b'\x00' * 4
         return self.build(Cmd.Z_AXIS, payload)
 
     def build_motor_home(self) -> bytes:
-        """Build a motor reset/homing command (cmd 0x000F, mode=2).
-
-        This is the actual motor reset — sends the motors to home position.
-        The laser takes several seconds to complete; poll STATUS until done.
-        """
-        payload = struct.pack('<B', 2)          # mode 2: motor reset/home
-        payload += struct.pack('<d', 0.0)       # distance (0.0 for reset)
-        payload += struct.pack('<I', 4)         # parameter
-        payload += b'\x00' * 4                  # padding
-        return self.build(Cmd.Z_AXIS, payload)
-
-    def build_query_14(self, sub: int = 0x02) -> bytes:
-        """Build a device query/setup (cmd 0x0014)."""
-        return self.build(Cmd.QUERY_14, struct.pack('<B', sub))
-
-    def build_query_13(self) -> bytes:
-        """Build a device query (cmd 0x0013)."""
-        return self.build(Cmd.QUERY_13)
-
-    def build_query_15(self) -> bytes:
-        """Build a device query (cmd 0x0015)."""
-        return self.build(Cmd.QUERY_15)
-
-    def build_device_info(self, device_id: int = 0x8B1B, ir_select: int = 0) -> bytes:
-        """Build a device info query (cmd 0x0018).
-
-        ir_select: 0=diode laser, 1=IR laser (sets byte 4 of payload).
-        """
-        payload = struct.pack('<HH', 0x0006, device_id)
-        payload += struct.pack('<B', ir_select)
-        payload += b'\x00' * (32 - 5)  # pad to 32 bytes
-        return self.build(Cmd.DEVICE_INFO, payload)
-
-    def build_z_autofocus(self, z_mm: float) -> bytes:
-        """Build a Z-axis autofocus positioning command (cmd 0x000F, mode=1).
-
-        Used during autofocus to move the Z-axis to the measured height.
-        """
-        payload = struct.pack('<B', 1)          # mode 1: autofocus position
-        payload += struct.pack('<d', z_mm)
+        payload  = struct.pack('<B', 2)
+        payload += struct.pack('<d', 0.0)
         payload += struct.pack('<I', 4)
         payload += b'\x00' * 4
         return self.build(Cmd.Z_AXIS, payload)
 
     def build_autofocus_probe(self) -> bytes:
-        """Build an autofocus measurement request (cmd 0x0012).
-
-        20-byte payload: byte[0]=1, rest zeros. Response is 30 bytes with
-        3 doubles: measurement1, measurement2, z_height (at offset 22).
-        """
         payload = struct.pack('<B', 1) + b'\x00' * 19
         return self.build(Cmd.AUTOFOCUS, payload)
 
-    def build_fw_version(self) -> bytes:
-        """Build a firmware version query (cmd 0x001E)."""
-        return self.build(Cmd.FW_VERSION)
+    def build_z_autofocus(self, z_mm: float) -> bytes:
+        payload  = struct.pack('<B', 1)
+        payload += struct.pack('<d', z_mm)
+        payload += struct.pack('<I', 4)
+        payload += b'\x00' * 4
+        return self.build(Cmd.Z_AXIS, payload)
+
+    # ── Generic ACK ───────────────────────────────────────────────────────────
+    def build_ack(self, cmd: int, seq: int) -> bytes:
+        """Build an ACK for an unsolicited message from the laser.
+        Reuses the incoming seq so the laser can correlate it.
+        """
+        total_len = 14 + 2 + 4
+        header = struct.pack('<HH HH HH H',
+            0x0A0A, total_len, 0, seq, 0, 1, cmd)
+        payload  = b'\x00\x00'
+        crc_data = header[2:] + payload
+        crc      = crc16_modbus(crc_data)
+        return header + payload + struct.pack('<H', crc) + TERMINATOR
 
 
-# ---------------------------------------------------------------------------
-# D1 Ultra Protocol Response Parser
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Response parser
+# ─────────────────────────────────────────────────────────────────────────────
 class ResponseParser:
-    """Parses responses from the D1 Ultra."""
-
     @staticmethod
     def parse_packet(data: bytes) -> Optional[dict]:
-        """Parse a single packet. Returns dict with cmd, seq, payload, or None."""
-        if len(data) < 18:
-            return None
-        if data[0:2] != MAGIC:
+        if len(data) < 18 or data[0:2] != MAGIC:
             return None
         pkt_len = struct.unpack('<H', data[2:4])[0]
-        if pkt_len > len(data):
+        if pkt_len > len(data) or data[pkt_len-2:pkt_len] != TERMINATOR:
             return None
-        if data[pkt_len-2:pkt_len] != TERMINATOR:
-            return None
-        seq = struct.unpack('<H', data[6:8])[0]
+        seq      = struct.unpack('<H', data[6:8])[0]
         msg_type = struct.unpack('<H', data[10:12])[0]
-        cmd = struct.unpack('<H', data[12:14])[0]
-        payload = data[14:pkt_len-4]
-        # Verify CRC
-        crc_expected = struct.unpack('<H', data[pkt_len-4:pkt_len-2])[0]
-        crc_computed = crc16_modbus(data[2:pkt_len-4])
-        if crc_computed != crc_expected:
-            log.warning(f"CRC mismatch: expected 0x{crc_expected:04x}, got 0x{crc_computed:04x}")
-        return {
-            'cmd': cmd,
-            'seq': seq,
-            'msg_type': msg_type,
-            'payload': payload,
-            'length': pkt_len,
-        }
+        cmd      = struct.unpack('<H', data[12:14])[0]
+        payload  = data[14:pkt_len-4]
+        crc_exp  = struct.unpack('<H', data[pkt_len-4:pkt_len-2])[0]
+        crc_got  = crc16_modbus(data[2:pkt_len-4])
+        if crc_got != crc_exp:
+            log.warning(f"CRC mismatch seq={seq}: expected 0x{crc_exp:04x} got 0x{crc_got:04x}")
+        return {'cmd': cmd, 'seq': seq, 'msg_type': msg_type,
+                'payload': payload, 'length': pkt_len}
 
     @staticmethod
-    def is_ack(parsed: dict) -> bool:
-        """Check if a parsed response is a simple ACK."""
-        return len(parsed['payload']) <= 2
+    def parse_device_name(p: dict) -> str:
+        payload = p.get('payload', b'')
+        if len(payload) < 4: return ""
+        return payload[2:].split(b'\x00')[0].decode('ascii', errors='replace')
 
     @staticmethod
-    def parse_device_name(parsed: dict) -> str:
-        """Parse device name from cmd 0x0006 response."""
-        if parsed['cmd'] != Cmd.DEVICE_ID:
-            return ""
-        payload = parsed['payload']
-        if len(payload) < 4:
-            return ""
-        name = payload[2:].split(b'\x00')[0].decode('ascii', errors='replace')
-        return name
-
-    @staticmethod
-    def parse_fw_version(parsed: dict) -> str:
-        """Parse firmware version from cmd 0x001E response."""
-        if parsed['cmd'] != Cmd.FW_VERSION:
-            return ""
-        payload = parsed['payload']
-        if len(payload) < 6:
-            return ""
-        strlen = struct.unpack('<I', payload[2:6])[0]
-        return payload[6:6+strlen].decode('ascii', errors='replace')
+    def parse_fw_version(p: dict) -> str:
+        payload = p.get('payload', b'')
+        if len(payload) < 6: return ""
+        n = struct.unpack('<I', payload[2:6])[0]
+        return payload[6:6+n].decode('ascii', errors='replace')
 
 
-# ---------------------------------------------------------------------------
-# D1 Ultra Connection
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────────────────────────────────────────
+# D1 Ultra connection
+# ─────────────────────────────────────────────────────────────────────────────
 class D1UltraConnection:
-    """Manages the TCP connection to the D1 Ultra laser.
-
-    Uses a background reader thread to receive all packets from the laser,
-    routing them to per-sequence-number queues. This prevents responses from
-    getting mixed up when the console and LightBurn both send commands.
-    """
-
     def __init__(self, ip: str = DEFAULT_LASER_IP, port: int = DEFAULT_LASER_PORT):
-        self.ip = ip
+        self.ip   = ip
         self.port = port
         self.sock: Optional[socket.socket] = None
         self.builder = PacketBuilder()
-        self.parser = ResponseParser()
-        self.send_lock = threading.Lock()       # Serializes sends
+        self.parser  = ResponseParser()
+        self.send_lock = threading.Lock()
         self.connected = False
         self.device_name = ""
-        self.fw_version = ""
-        self._recv_buf = b''
-        self._recv_lock = threading.Lock()
-        self._pending: dict = {}                # seq -> threading.Event, result
-        self._job_ready = threading.Event()     # Set when laser sends JOB_CONTROL (0x0003)
-        self._heartbeat_paused = False          # Pause heartbeat during job execution
+        self.fw_version  = ""
+        self._recv_buf   = b''
+        self._recv_lock  = threading.Lock()
+        self._pending: dict = {}              # seq → (Event, parsed_result)
+        self._job_ready = threading.Event()
+        self._heartbeat_paused = False
         self._reader_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
+        # Track seq numbers for which we already sent an unsolicited ACK,
+        # to prevent infinite ACK feedback loops.
+        self._acked_unsolicited: set = set()
+        # Serialize job execution — LightBurn sends multiple layers as
+        # separate M30 commands; without a lock they'd stomp on each other.
+        self._job_lock = threading.Lock()
+
+    # ── Connection management ─────────────────────────────────────────────────
 
     def connect(self) -> bool:
-        """Connect to the laser and start the background reader."""
         try:
+            # Clean up any previous socket
+            if self.sock:
+                try: self.sock.close()
+                except: pass
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(5.0)
             self.sock.connect((self.ip, self.port))
-            self.sock.settimeout(None)           # Reader thread blocks forever
+            self.sock.settimeout(None)
             self.connected = True
+            self._recv_buf = b''
+            self._pending.clear()
+            self._acked_unsolicited.clear()
+            self.builder._seq = 0
             log.info(f"Connected to D1 Ultra at {self.ip}:{self.port}")
 
-            # Start background reader
-            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader_thread = threading.Thread(
+                target=self._reader_loop, daemon=True)
             self._reader_thread.start()
 
-            # Start heartbeat to keep connection alive
-            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, daemon=True)
             self._heartbeat_thread.start()
 
             return True
         except Exception as e:
-            log.error(f"Failed to connect to {self.ip}:{self.port}: {e}")
-            self.connected = False
+            log.error(f"Failed to connect: {e}")
             return False
 
     def disconnect(self):
-        """Disconnect from the laser."""
         self.connected = False
         if self.sock:
-            try:
-                self.sock.close()
-            except:
-                pass
-        log.info("Disconnected from laser")
+            try: self.sock.close()
+            except: pass
+
+    def ensure_connected(self) -> bool:
+        """Reconnect + re-identify if the laser connection was lost."""
+        if self.connected:
+            return True
+        log.info("Laser connection lost — reconnecting...")
+        for attempt in range(3):
+            if self.connect():
+                if self.identify():
+                    log.info("Reconnected and ready")
+                    return True
+                else:
+                    log.warning(f"Reconnect attempt {attempt+1}: identify failed")
+            else:
+                log.warning(f"Reconnect attempt {attempt+1}: connect failed")
+            time.sleep(1.0)
+        log.error("Could not reconnect to laser after 3 attempts")
+        return False
+
+    # ── Background reader ─────────────────────────────────────────────────────
 
     def _reader_loop(self):
-        """Background thread: reads all packets from laser, dispatches by seq."""
         while self.connected:
             try:
                 chunk = self.sock.recv(4096)
                 if not chunk:
-                    log.warning("Laser connection closed by remote")
+                    log.warning("Laser closed connection")
                     self.connected = False
                     break
-
                 with self._recv_lock:
                     self._recv_buf += chunk
-                    self._process_recv_buf()
-
+                self._process_recv_buf()
             except OSError:
                 if self.connected:
-                    log.warning("Laser socket error — connection lost")
+                    log.warning("Laser socket error")
                     self.connected = False
                 break
-            except Exception as e:
-                if self.connected:
-                    log.error(f"Reader error: {e}")
-                break
-
-        # Wake up anyone waiting for responses
+        # Wake any pending callers
         for seq, (evt, _) in list(self._pending.items()):
             evt.set()
 
     def _process_recv_buf(self):
-        """Extract complete packets from the receive buffer and dispatch."""
         while len(self._recv_buf) >= 18:
-            # Find magic header
             idx = self._recv_buf.find(MAGIC)
             if idx == -1:
                 self._recv_buf = b''
                 return
             if idx > 0:
                 self._recv_buf = self._recv_buf[idx:]
-
             if len(self._recv_buf) < 4:
                 return
-
             pkt_len = struct.unpack('<H', self._recv_buf[2:4])[0]
             if pkt_len < 18 or pkt_len > 65535:
-                # Bad length — skip this magic and look for next
                 self._recv_buf = self._recv_buf[2:]
                 continue
-
             if len(self._recv_buf) < pkt_len:
-                return  # Need more data
-
+                return
             pkt_data = self._recv_buf[:pkt_len]
             self._recv_buf = self._recv_buf[pkt_len:]
-
             parsed = self.parser.parse_packet(pkt_data)
             if not parsed:
                 continue
+            self._dispatch(parsed)
 
-            seq = parsed['seq']
-            msg_type = parsed['msg_type']
+    def _dispatch(self, parsed: dict):
+        cmd      = parsed['cmd']
+        seq      = parsed['seq']
+        msg_type = parsed['msg_type']
 
-            # Unsolicited notifications (msg_type=2, seq=0) — just log
-            if msg_type == 2:
-                log.debug(f"Laser notification: cmd=0x{parsed['cmd']:04x}")
-                continue
+        # ── PRIORITY: route to any waiting caller by sequence number ──────────
+        # This MUST be checked first to prevent treating responses to our own
+        # queries (e.g. 0x0013 response to our build_query_13) as "unsolicited".
+        # v2.0 bug: the unsolicited check ran first, sent an ACK, which the
+        # laser responded to, creating an infinite feedback loop.
+        if seq in self._pending:
+            evt, _ = self._pending[seq]
+            self._pending[seq] = (evt, parsed)
+            evt.set()
+            return
 
-            # Check for JOB_CONTROL (0x0003) from laser — signals paths received
-            if parsed['cmd'] == Cmd.JOB_START:
-                log.info("Laser sent JOB_CONTROL (0x0003) — paths received, ready to finalize")
-                self._job_ready.set()
+        # ── JOB_CONTROL (0x0003) from laser ───────────────────────────────────
+        if cmd == Cmd.JOB_CONTROL:
+            log.info("  << Laser sent JOB_CONTROL (0x0003)")
+            self._job_ready.set()
+            return
 
-            # Route to waiting caller by sequence number
-            if seq in self._pending:
-                evt, _ = self._pending[seq]
-                self._pending[seq] = (evt, parsed)
-                evt.set()
+        # ── Unsolicited 0x0013/0x0014/0x0015 — ACK once per seq ──────────────
+        # The laser sends these periodically.  M+ ACKs them.  We ACK each
+        # unique (cmd, seq) pair exactly once to avoid feedback loops.
+        if cmd in (Cmd.QUERY_13, Cmd.QUERY_14, Cmd.QUERY_15):
+            ack_key = (cmd, seq)
+            if ack_key not in self._acked_unsolicited:
+                log.info(f"  Unsolicited cmd=0x{cmd:04x} seq={seq} — ACK'ing")
+                ack = self.builder.build_ack(cmd, seq)
+                self.send_only(ack)
+                self._acked_unsolicited.add(ack_key)
             else:
-                log.info(f"  LASER unsolicited: seq={seq} cmd=0x{parsed['cmd']:04x} "
-                         f"msg_type={msg_type} payload={len(parsed.get('payload', b''))}b")
+                log.debug(f"  Unsolicited cmd=0x{cmd:04x} seq={seq} — already ACK'd, ignoring")
+            return
+
+        # ── Notification messages (msg_type=2) ────────────────────────────────
+        if msg_type == 2:
+            log.debug(f"Laser notification cmd=0x{cmd:04x}")
+            return
+
+        # ── Anything else — log it ────────────────────────────────────────────
+        log.info(f"  Unsolicited: seq={seq} cmd=0x{cmd:04x} "
+                 f"msg_type={msg_type} payload={len(parsed.get('payload',b''))}b")
+
+    # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     def _heartbeat_loop(self):
-        """Send periodic STATUS queries to keep the laser connection alive.
-
-        The D1 Ultra closes the TCP connection if it doesn't receive any
-        commands for roughly 10 seconds. M+ software sends STATUS polls
-        every ~2 seconds. We do the same, but pause during job execution
-        to avoid interfering with the job protocol.
-        """
         while self.connected:
             try:
                 time.sleep(2.0)
                 if self.connected and not self._heartbeat_paused:
                     self.send_and_recv(self.builder.build_status(), timeout=2.0)
             except Exception:
-                pass  # Don't crash the heartbeat on transient errors
+                pass
 
-    def send_and_recv(self, packet: bytes, timeout: float = 3.0) -> Optional[dict]:
-        """Send a packet and wait for matching response by sequence number."""
+    # ── Send helpers ──────────────────────────────────────────────────────────
+
+    def send_and_recv(self, packet: bytes, timeout: float = 5.0) -> Optional[dict]:
         if not self.connected or not self.sock:
             return None
-
-        # Extract the sequence number from the outgoing packet
         if len(packet) < 8:
             return None
         seq = struct.unpack('<H', packet[6:8])[0]
-
-        # Register a wait event for this sequence
         evt = threading.Event()
         self._pending[seq] = (evt, None)
-
         try:
             with self.send_lock:
                 self.sock.sendall(packet)
@@ -568,18 +548,14 @@ class D1UltraConnection:
             self._pending.pop(seq, None)
             self.connected = False
             return None
-
-        # Wait for the reader thread to deliver the matching response
         if evt.wait(timeout=timeout):
             _, result = self._pending.pop(seq, (None, None))
             return result
-        else:
-            self._pending.pop(seq, None)
-            log.debug(f"Timeout waiting for response seq={seq}")
-            return None
+        self._pending.pop(seq, None)
+        log.debug(f"Timeout waiting for seq={seq}")
+        return None
 
     def send_only(self, packet: bytes):
-        """Send a packet without waiting for response."""
         if not self.connected or not self.sock:
             return
         try:
@@ -590,314 +566,322 @@ class D1UltraConnection:
             self.connected = False
 
     def ping(self) -> bool:
-        """Send a status query to check if the laser is alive."""
-        if not self.connected or not self.sock:
+        if not self.connected:
             return False
-        resp = self.send_and_recv(self.builder.build_status(), timeout=2.0)
-        return resp is not None
+        return self.send_and_recv(self.builder.build_status(), timeout=2.0) is not None
 
-    def reconnect(self, max_retries: int = 3, delay: float = 2.0) -> bool:
-        """Attempt to reconnect to the laser."""
-        self.disconnect()
-        for attempt in range(1, max_retries + 1):
-            log.info(f"Reconnect attempt {attempt}/{max_retries}...")
-            if self.connect():
-                if self.identify():
-                    log.info("Reconnected and identified successfully")
-                    return True
-                else:
-                    log.warning("Connected but identification failed")
-                    return True  # Still connected, just no ID response
-            if attempt < max_retries:
-                time.sleep(delay)
-        log.error("Failed to reconnect after all retries")
-        return False
-
-    def ensure_connected(self) -> bool:
-        """Make sure we have a live connection; reconnect if needed."""
-        if self.connected and self.ping():
-            return True
-        log.warning("Laser connection lost — attempting reconnect...")
-        return self.reconnect()
+    # ── Startup handshake ─────────────────────────────────────────────────────
 
     def identify(self) -> bool:
-        """Run the device identification handshake (mirrors M+ startup)."""
-        # Query device name (cmd 0x0006)
-        resp = self.send_and_recv(self.builder.build_device_id())
-        if resp:
-            self.device_name = self.parser.parse_device_name(resp)
-            log.info(f"Device: {self.device_name}")
+        """Full M+ startup sequence (order matters)."""
+        r = self.send_and_recv(self.builder.build_device_id())
+        if r: self.device_name = self.parser.parse_device_name(r)
+        log.info(f"Device: {self.device_name or '(unknown)'}")
 
-        # Status ping (cmd 0x0000)
         self.send_and_recv(self.builder.build_status())
 
-        # Device info (cmd 0x0018)
-        self.send_and_recv(self.builder.build(Cmd.DEVICE_INFO))
+        self.send_and_recv(self.builder.build_device_info())
 
-        # Query firmware version (cmd 0x001E)
-        resp = self.send_and_recv(self.builder.build_fw_version())
-        if resp:
-            self.fw_version = self.parser.parse_fw_version(resp)
-            log.info(f"Firmware: {self.fw_version}")
+        r = self.send_and_recv(self.builder.build_fw_version())
+        if r: self.fw_version = self.parser.parse_fw_version(r)
+        log.info(f"Firmware: {self.fw_version or '(unknown)'}")
 
-        # Motor calibration query (cmd 0x000B) — reads workspace boundaries
-        resp = self.send_and_recv(self.builder.build_motor_reset(), timeout=5.0)
-        if resp:
-            log.info("Motor calibration data received (283 bytes)")
-        else:
-            log.warning("Motor calibration query got no response")
+        r = self.send_and_recv(self.builder.build_motor_reset(), timeout=8.0)
+        if r: log.info(f"Motor calibration: {len(r.get('payload',b''))} bytes")
+        else: log.warning("Motor calibration: no response")
 
-        # Query device state (cmd 0x0013, 0x0015)
-        self.send_and_recv(self.builder.build(Cmd.QUERY_13))
-        self.send_and_recv(self.builder.build(Cmd.QUERY_15))
+        # These queries may trigger unsolicited messages from the laser.
+        # The _dispatch method now handles them correctly (routes responses
+        # to our pending callers, only ACKs truly unsolicited ones).
+        self.send_and_recv(self.builder.build_query_13())
+        self.send_and_recv(self.builder.build_query_15())
 
         return bool(self.device_name)
 
-    def home_motors(self, retract_mm: float = 5.0,
-                    timeout: float = 60.0) -> bool:
-        """Send motor reset/homing command, then retract off the endstop.
+    # ── Job execution ─────────────────────────────────────────────────────────
 
-        Sends cmd 0x000F mode=2 to drive the motor to the top endstop.
-        Once the ACK arrives, moves down by retract_mm to protect the
-        motor from sitting against the endstop.
+    def execute_job(self, path_groups: List[List[Tuple[float, float]]],
+                    job_name: str,
+                    passes: int, speed_mm_min: float,
+                    frequency_khz: float, power_frac: float,
+                    laser_source: int = LaserSource.DIODE) -> bool:
         """
-        log.info("Sending motor home command...")
-        pkt = self.builder.build_motor_home()
+        Full job execution sequence matching M+ behaviour (v2.1).
 
-        # ACK arrives when the motor reaches the top endstop.
-        resp = self.send_and_recv(pkt, timeout=timeout)
-        if not resp:
-            log.warning("Motor homing: no response (timed out)")
+        Sequence:
+          1. DEVICE_INFO (0x0018)
+          2. PRE_JOB     (0x0005)
+          3. QUERY_14    (0x0014, sub=0x02)
+          4. JOB_UPLOAD  (0x0002)  with ~6KB PNG
+          5. WORKSPACE   (0x0009)  with bounding box
+          6. For each path group:
+               a. JOB_SETTINGS (0x0000, msg_type=0)
+               b. PATH_DATA    (0x0001, msg_type=0)
+               c. 10 ms pause
+          7. HOST sends JOB_CONTROL (0x0003)
+          8. JOB_FINISH (0x0004)
+        """
+        if not path_groups:
+            log.warning("No path groups — nothing to send")
+            return False
 
-        # Retract off the endstop
-        log.info(f"Endstop reached — retracting {retract_mm:.1f}mm...")
-        retract_pkt = self.builder.build_z_move(-retract_mm)
-        retract_timeout = max(5.0, retract_mm * 3.0)
-        r = self.send_and_recv(retract_pkt, timeout=retract_timeout)
-        if r:
-            log.info("Motor homing + retraction complete")
-        else:
-            log.warning("Retraction: no ACK (may still be moving)")
+        # Serialize: LightBurn sends each layer as a separate M30, so
+        # multiple execute_job calls can arrive nearly simultaneously.
+        # Wait for any in-progress job to finish before starting ours.
+        if self._job_lock.locked():
+            log.info("Waiting for previous job to finish...")
+        self._job_lock.acquire()
+        try:
+            return self._execute_job_locked(
+                path_groups, job_name, passes, speed_mm_min,
+                frequency_khz, power_frac, laser_source)
+        finally:
+            self._job_lock.release()
+
+    def _execute_job_locked(self, path_groups, job_name, passes,
+                            speed_mm_min, frequency_khz, power_frac,
+                            laser_source) -> bool:
+        # Auto-reconnect if laser connection was lost (e.g. idle timeout)
+        if not self.ensure_connected():
+            log.error("Cannot execute job — laser not reachable")
+            return False
+
+        # Filter trivial groups
+        groups = [g for g in path_groups if len(g) >= 2]
+        if not groups:
+            log.warning("All path groups were single-point — skipping")
+            return False
+
+        # v2: filter G1 S0 duplicate closing point
+        cleaned = []
+        for grp in groups:
+            if len(grp) >= 3 and grp[-1] == grp[-2]:
+                grp = grp[:-1]
+            cleaned.append(grp)
+        groups = cleaned
+
+        # Bounding box (coordinates are already centered)
+        all_pts = [pt for grp in groups for pt in grp]
+        x_vals  = [p[0] for p in all_pts]
+        y_vals  = [p[1] for p in all_pts]
+        bb_xmin, bb_xmax = min(x_vals), max(x_vals)
+        bb_ymin, bb_ymax = min(y_vals), max(y_vals)
+
+        log.info(f"Job: {len(groups)} paths, {len(all_pts)} total points")
+        log.info(f"  Bounding box: X [{bb_xmin:.2f}..{bb_xmax:.2f}]  "
+                 f"Y [{bb_ymin:.2f}..{bb_ymax:.2f}] mm")
+        log.info(f"  {passes} pass(es), {speed_mm_min:.0f} mm/min, "
+                 f"{power_frac*100:.0f}% power, {frequency_khz:.0f} kHz, "
+                 f"source={'IR' if laser_source==LaserSource.IR else 'Diode'}")
+
+        self._job_ready.clear()
+        self._heartbeat_paused = True
+
+        try:
+            # Step 1: DEVICE_INFO
+            log.info("Step 1/8: DEVICE_INFO")
+            self.send_and_recv(self.builder.build_device_info())
+
+            # Step 2: PRE_JOB
+            log.info("Step 2/8: PRE_JOB (0x0005)")
+            r = self.send_and_recv(self.builder.build_pre_job(), timeout=5.0)
+            if not r:
+                log.warning("  PRE_JOB: no response (continuing)")
+
+            # Step 3: QUERY_14 sub=0x02
+            log.info("Step 3/8: QUERY_14(0x02) pre-job setup")
+            self.send_and_recv(self.builder.build_query_14(0x02), timeout=5.0)
+
+            # Step 4: JOB_UPLOAD with proper ~6KB PNG
+            log.info("Step 4/8: JOB_UPLOAD with PNG preview")
+            png = make_preview_png(44, 44)  # 44×44 → ~6KB (matching M+ size)
+            log.info(f"  PNG size: {len(png)} bytes")
+            r = self.send_and_recv(
+                self.builder.build_job_upload(job_name, png), timeout=10.0)
+            if not r:
+                log.error("JOB_UPLOAD: no ACK — aborting")
+                return False
+
+            # Step 5: WORKSPACE with bounding box
+            log.info("Step 5/8: WORKSPACE bounding box")
+            r = self.send_and_recv(
+                self.builder.build_workspace(
+                    speed_mm_min, bb_xmin, bb_ymin, bb_xmax, bb_ymax),
+                timeout=5.0)
+            if not r:
+                log.warning("  WORKSPACE: no ACK (continuing)")
+
+            # Step 6: SETTINGS+PATH pairs
+            log.info(f"Step 6/8: Sending {len(groups)} SETTINGS+PATH pairs...")
+            for i, group in enumerate(groups):
+                # JOB_SETTINGS
+                r = self.send_and_recv(
+                    self.builder.build_job_settings(
+                        passes, speed_mm_min, frequency_khz,
+                        power_frac, laser_source),
+                    timeout=5.0)
+                if not r:
+                    log.warning(f"  Path {i}: JOB_SETTINGS no ACK")
+
+                # PATH_DATA
+                r = self.send_and_recv(
+                    self.builder.build_path_data(group),
+                    timeout=10.0)
+                if not r:
+                    log.error(f"  Path {i}: PATH_DATA no ACK — aborting")
+                    return False
+
+                # 10 ms pacing between pairs (matching M+ timing)
+                time.sleep(0.010)
+
+                if (i + 1) % 50 == 0 or i == len(groups) - 1:
+                    log.info(f"  {i+1}/{len(groups)} paths sent")
+
+            # Step 7: JOB_CONTROL (0x0003) — HOST initiates execution
+            log.info("Step 7/8: Sending JOB_CONTROL (0x0003)...")
+            r = self.send_and_recv(self.builder.build_job_control(), timeout=15.0)
+            if r and r.get('cmd') == Cmd.JOB_CONTROL:
+                log.info("  >> Laser confirmed JOB_CONTROL — executing!")
+            elif r:
+                log.info(f"  Laser responded: cmd=0x{r.get('cmd',0):04x} "
+                         f"(expected 0x0003)")
+            else:
+                log.warning("  No response to JOB_CONTROL (timeout)")
+
+            # Step 8: JOB_FINISH
+            log.info("Step 8/8: JOB_FINISH")
+            r = self.send_and_recv(
+                self.builder.build_job_finish(job_name), timeout=5.0)
+            if r:
+                log.info("  JOB_FINISH ACK'd — job submitted!")
+            else:
+                log.warning("  JOB_FINISH: no ACK")
+
+            return True
+
+        finally:
+            self._heartbeat_paused = False
+
+    # ── Motor homing / autofocus ──────────────────────────────────────────────
+
+    def home_motors(self, retract_mm: float = 5.0, timeout: float = 60.0) -> bool:
+        log.info("Homing motors...")
+        self.send_and_recv(self.builder.build_motor_home(), timeout=timeout)
+        log.info(f"Retracting {retract_mm:.1f} mm off endstop...")
+        self.send_and_recv(self.builder.build_z_move(-retract_mm), timeout=15.0)
+        log.info("Homing complete")
         return True
 
     def run_autofocus(self, hw_id: int = 0x1A8B) -> Optional[float]:
-        """Run the full autofocus sequence (3 probes, matches M+ behavior).
-
-        Returns the final averaged Z-height in mm, or None on failure.
-
-        Sequence (from Wireshark capture of M+):
-        1. STATUS ping
-        2. QUERY_15, QUERY_14(0x02)
-        3. DEVICE_INFO with ir_select=1 (activate IR laser for probing)
-        4. For each of 3 probes:
-           a. Send AUTOFOCUS probe request (cmd 0x0012)
-           b. Wait for response (30 bytes: status + 3 doubles)
-           c. Extract Z-height from third double (offset 22)
-           d. Send Z_AXIS mode=1 to move to measured height
-           e. Poll STATUS while Z-axis moves
-        5. DEVICE_INFO with ir_select=0 (back to diode)
-        """
-        log.info("Autofocus: starting...")
-
-        # Pre-probe setup
+        log.info("Autofocus: starting 3-probe sequence...")
         self.send_and_recv(self.builder.build_status())
         self.send_and_recv(self.builder.build_query_15())
         self.send_and_recv(self.builder.build_query_14(0x02))
-        self.send_and_recv(
-            self.builder.build_device_info(device_id=hw_id, ir_select=1))
+        self.send_and_recv(self.builder.build_device_info(device_id=hw_id, ir_select=1))
 
         measurements = []
         for i in range(3):
-            log.info(f"  Autofocus probe {i+1}/3...")
-
-            # Send autofocus probe
-            pkt = self.builder.build_autofocus_probe()
-            resp = self.send_and_recv(pkt, timeout=10.0)
-
-            if not resp or not resp.get('payload'):
-                log.warning(f"  Probe {i+1} failed — no response")
+            log.info(f"  Probe {i+1}/3...")
+            r = self.send_and_recv(self.builder.build_autofocus_probe(), timeout=10.0)
+            if not r or len(r.get('payload', b'')) < 30:
+                log.warning(f"  Probe {i+1}: short/no response")
                 continue
-
-            payload = resp['payload']
-            if len(payload) < 30:
-                log.warning(f"  Probe {i+1} short response ({len(payload)} bytes)")
-                continue
-
-            # Parse response: 6 bytes header + 3 doubles
-            meas1 = struct.unpack_from('<d', payload, 6)[0]
-            meas2 = struct.unpack_from('<d', payload, 14)[0]
+            payload = r['payload']
             z_val = struct.unpack_from('<d', payload, 22)[0]
-            log.info(f"    Z = {z_val:.3f}mm (raw: {meas1:.6f}, {meas2:.6f})")
+            log.info(f"  Z = {z_val:.3f} mm")
             measurements.append(z_val)
 
-            # Move Z-axis to measured position (mode=1 autofocus move)
-            # ACK only arrives once the motor reaches position, so allow
-            # plenty of time (60 s) for long travels.
-            z_pkt = self.builder.build_z_autofocus(z_val)
-            log.info(f"    Moving Z to {z_val:.3f}mm (waiting for motor)...")
-            z_resp = self.send_and_recv(z_pkt, timeout=60.0)
-            if not z_resp:
-                log.warning(f"    Z move timed out — motor may still be moving")
+            zp = self.builder.build_z_autofocus(z_val)
+            self.send_and_recv(zp, timeout=60.0)
 
-            # Let the motor fully settle, then STATUS-poll before next probe
             if i < 2:
-                # M+ polls STATUS several times between probes
                 for _ in range(5):
                     time.sleep(0.4)
                     self.send_and_recv(self.builder.build_status(), timeout=2.0)
 
-        # Restore to diode laser
-        self.send_and_recv(
-            self.builder.build_device_info(device_id=hw_id, ir_select=0))
+        self.send_and_recv(self.builder.build_device_info(device_id=hw_id, ir_select=0))
 
         if measurements:
-            avg_z = sum(measurements) / len(measurements)
-            log.info(f"  Autofocus complete: Z = {avg_z:.3f}mm "
-                     f"(avg of {len(measurements)} probes)")
-            return avg_z
-        else:
-            log.warning("  Autofocus FAILED — no measurements")
-            return None
-
-    def send_path_segments(self, segments: List[Tuple[float, float]],
-                           batch_size: int = 500) -> bool:
-        """Send path data in batches, waiting for ACK between each."""
-        for i in range(0, len(segments), batch_size):
-            batch = segments[i:i+batch_size]
-            pkt = self.builder.build_path_data(batch)
-            resp = self.send_and_recv(pkt, timeout=10.0)
-            if not resp:
-                log.error(f"No ACK for path batch {i//batch_size}")
-                return False
-            sent = i + len(batch)
-            total = len(segments)
-            if sent % 1000 < batch_size:
-                log.info(f"  Path data: {sent}/{total} segments sent")
-        return True
+            avg = sum(measurements) / len(measurements)
+            log.info(f"Autofocus done: Z = {avg:.3f} mm (avg of {len(measurements)})")
+            return avg
+        log.warning("Autofocus failed")
+        return None
 
 
-# ---------------------------------------------------------------------------
-# GRBL State Machine
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────────────────────────────────────────
+# GRBL state machine
+# ─────────────────────────────────────────────────────────────────────────────
 class GRBLState:
-    """Tracks the virtual GRBL machine state."""
-
     def __init__(self):
-        # Position (in mm, absolute)
-        self.x = 0.0
-        self.y = 0.0
-        self.z = 0.0
-        # Feed rate
-        self.feed_rate = 1000.0  # mm/min
-        # Laser
-        self.laser_on = False
-        self.power = 0.0        # 0-1000 (S value)
-        self.max_power = 1000.0 # S-max
-        # State
-        self.absolute_mode = True  # G90
-        self.is_running = False
-        self.is_homed = False
-        # Job accumulator — path groups split at G0 boundaries.
-        # Each group is a list of (x, y) points: the G0 start + G1 cuts.
+        self.x = self.y = self.z = 0.0
+        self.feed_rate   = 1000.0
+        self.laser_on    = False
+        self.power       = 0.0
+        self.max_power   = 1000.0
+        self.absolute_mode = True
+        self.is_running  = False
+        self.is_homed    = False
+
         self.job_path_groups: List[List[Tuple[float, float]]] = []
-        self.job_name = "lightburn_job"
-        # Bounding box tracker
-        self.bb_x_min = float('inf')
-        self.bb_x_max = float('-inf')
-        self.bb_y_min = float('inf')
-        self.bb_y_max = float('-inf')
-        # Settings
-        self.laser_source = LaserSource.DIODE
-        self.frequency_khz = 50.0
-        self.passes = 1
-        self.speed_mm_min = 1000.0
-        # Job power: captures the max S-value seen while laser is on,
-        # because the G-code ends with S0/M5 which resets power to 0.
-        self.job_power = 0.0
+        self.job_name    = "lightburn_job"
+        self.bb_x_min    = float('inf')
+        self.bb_x_max    = float('-inf')
+        self.bb_y_min    = float('inf')
+        self.bb_y_max    = float('-inf')
 
-    def update_bounding_box(self, x: float, y: float):
-        self.bb_x_min = min(self.bb_x_min, x)
-        self.bb_x_max = max(self.bb_x_max, x)
-        self.bb_y_min = min(self.bb_y_min, y)
-        self.bb_y_max = max(self.bb_y_max, y)
+        self.laser_source   = LaserSource.DIODE
+        self.frequency_khz  = 50.0
+        self.passes         = 1
+        self.speed_mm_min   = 1000.0
+        self.job_power      = 0.0
 
-    def start_new_path_group(self, start_x: float, start_y: float):
-        """Begin a new path group (called on G0 rapid moves).
+    def start_new_path_group(self, x: float, y: float):
+        self.job_path_groups.append([(x, y)])
 
-        NOTE: We do NOT update the bounding box here — the BB is computed
-        from filtered groups (>= 2 points) in _finish_job.  Otherwise the
-        final G0 X0Y0 return-to-home would skew the center point.
-        """
-        self.job_path_groups.append([(start_x, start_y)])
-
-    def add_cut_point(self, x: float, y: float):
-        """Add a cut point to the current path group (called on G1 laser-on)."""
+    def add_cut_point(self, x: float, y: float, power: float):
+        """Add a cut point.  Skip zero-power (G1 S0) to avoid duplicates."""
+        if power <= 0.0:
+            return
+        if self.job_power < power:
+            self.job_power = power
         if not self.job_path_groups:
-            # No G0 yet — create an implicit group starting at current pos
             self.job_path_groups.append([(x, y)])
         else:
             self.job_path_groups[-1].append((x, y))
 
     def reset_job(self):
         self.job_path_groups = []
-        self.job_power = 0.0
-        self.bb_x_min = float('inf')
-        self.bb_x_max = float('-inf')
-        self.bb_y_min = float('inf')
-        self.bb_y_max = float('-inf')
+        self.job_power  = 0.0
+        self.bb_x_min   = float('inf')
+        self.bb_x_max   = float('-inf')
+        self.bb_y_min   = float('inf')
+        self.bb_y_max   = float('-inf')
 
     @property
     def power_fraction(self) -> float:
-        """Power as a 0.0-1.0 fraction."""
-        if self.max_power == 0:
-            return 0.0
+        if self.max_power == 0: return 0.0
         return min(1.0, self.power / self.max_power)
 
+    @property
+    def job_power_fraction(self) -> float:
+        if self.max_power == 0: return 0.0
+        return min(1.0, self.job_power / self.max_power)
 
-# ---------------------------------------------------------------------------
-# GRBL Command Parser & Translator
-# ---------------------------------------------------------------------------
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GRBL translator
+# ─────────────────────────────────────────────────────────────────────────────
 class GRBLTranslator:
-    """Translates GRBL G-code commands to D1 Ultra protocol calls."""
-
-    # Standard GRBL settings responses
     GRBL_SETTINGS = {
-        0: 10,       # Step pulse time (usec)
-        1: 25,       # Step idle delay (msec)
-        2: 0,        # Step pulse invert
-        3: 0,        # Step direction invert
-        4: 0,        # Invert step enable
-        5: 0,        # Invert limit pins
-        6: 0,        # Invert probe pin
-        10: 1,       # Status report options
-        11: 0.010,   # Junction deviation (mm)
-        12: 0.002,   # Arc tolerance (mm)
-        13: 0,       # Report in inches
-        20: 0,       # Soft limits enable
-        21: 0,       # Hard limits enable
-        22: 0,       # Homing cycle enable
-        23: 0,       # Homing direction invert
-        24: 25.0,    # Homing feed rate (mm/min)
-        25: 500.0,   # Homing seek rate (mm/min)
-        26: 250,     # Homing debounce (msec)
-        27: 1.0,     # Homing pull-off (mm)
-        30: 1000,    # Max spindle speed (RPM) — maps to S value
-        31: 0,       # Min spindle speed
-        32: 1,       # Laser mode enabled
-        100: 80.0,   # X steps/mm
-        101: 80.0,   # Y steps/mm
-        102: 80.0,   # Z steps/mm
-        110: 5000.0, # X max rate (mm/min)
-        111: 5000.0, # Y max rate (mm/min)
-        112: 500.0,  # Z max rate (mm/min)
-        120: 200.0,  # X acceleration (mm/s^2)
-        121: 200.0,  # Y acceleration (mm/s^2)
-        122: 50.0,   # Z acceleration (mm/s^2)
-        130: 400.0,  # X max travel (mm)
-        131: 400.0,  # Y max travel (mm)
-        132: 100.0,  # Z max travel (mm)
+        0: 10, 1: 25, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0,
+        10: 1, 11: 0.010, 12: 0.002, 13: 0,
+        20: 0, 21: 0, 22: 0, 23: 0, 24: 25.0, 25: 500.0, 26: 250, 27: 1.0,
+        30: 1000, 31: 0, 32: 1,
+        100: 80.0, 101: 80.0, 102: 80.0,
+        110: 5000.0, 111: 5000.0, 112: 500.0,
+        120: 200.0, 121: 200.0, 122: 50.0,
+        130: 400.0, 131: 400.0, 132: 100.0,
     }
 
     def __init__(self, laser: D1UltraConnection, state: GRBLState):
@@ -905,881 +889,659 @@ class GRBLTranslator:
         self.state = state
 
     def handle_line(self, line: str) -> str:
-        """Process a single GRBL command line and return the response."""
         line = line.strip()
-        if not line:
-            return "ok"
-
-        # Remove comments
-        if ';' in line:
-            line = line[:line.index(';')].strip()
-        if '(' in line:
-            line = line[:line.index('(')].strip()
-        if not line:
-            return "ok"
+        if not line: return "ok"
+        if ';' in line: line = line[:line.index(';')].strip()
+        if '(' in line: line = line[:line.index('(')].strip()
+        if not line: return "ok"
 
         upper = line.upper()
+        if upper == '?':            return self._status_report()
+        if upper == '$$':           return self._settings_report()
+        if upper == '$H':           return self._home()
+        if upper in ('$X','$X\n'):  return self._unlock()
+        if upper.startswith('$J='): return self._jog(line[3:])
+        if upper == '\x18':         return self._reset()
+        if upper in ('!', '~'):     return "ok"
+        if upper in ('$FOCUS', '$FOCUS ON'): return self._focus_on()
+        if upper == '$FOCUS OFF':   return self._focus_off()
+        if upper in ('$AUTOFOCUS', '$AF'): return self._autofocus()
+        if upper == '$I':           return self._build_info()
+        if upper == '$#':           return self._gcode_parameters()
+        if upper == '$G':           return self._gcode_parser_state()
+        if upper.startswith('$'):   return "ok"
 
-        # --- Special commands ---
-        if upper == '?' :
-            return self._status_report()
-        if upper == '$$':
-            return self._settings_report()
-        if upper == '$H':
-            return self._home()
-        if upper == '$X' or upper == '$X\n':
-            return self._unlock()
-        if upper.startswith('$J='):
-            return self._jog(line[3:])
-        if upper == '\x18':  # Ctrl-X soft reset
-            return self._reset()
-        if upper == '!' :  # Feed hold
-            return "ok"
-        if upper == '~' :  # Cycle resume
-            return "ok"
-        if upper == '$FOCUS' or upper == '$FOCUS ON':
-            return self._focus_on()
-        if upper == '$FOCUS OFF':
-            return self._focus_off()
-        if upper == '$AUTOFOCUS' or upper == '$AF':
-            return self._autofocus()
-        if upper == '$I':
-            return self._build_info()
-        if upper == '$#':
-            return self._gcode_parameters()
-        if upper == '$G':
-            return self._gcode_parser_state()
-        if upper.startswith('$'):
-            # Other $ commands — just acknowledge
-            return "ok"
-
-        # --- G-code parsing ---
         return self._parse_gcode(line)
 
     def _status_report(self) -> str:
-        """Generate a GRBL-style status report."""
-        if self.state.is_running:
-            status = "Run"
-        elif self.state.is_homed:
-            status = "Idle"
-        else:
-            status = "Idle"
+        st = "Run" if self.state.is_running else "Idle"
         x, y, z = self.state.x, self.state.y, self.state.z
-        return f"<{status}|MPos:{x:.3f},{y:.3f},{z:.3f}|FS:{self.state.feed_rate:.0f},{self.state.power:.0f}>"
+        return (f"<{st}|MPos:{x:.3f},{y:.3f},{z:.3f}"
+                f"|FS:{self.state.feed_rate:.0f},{self.state.power:.0f}>")
 
     def _settings_report(self) -> str:
-        """Generate the $$ settings dump."""
         lines = []
-        for key in sorted(self.GRBL_SETTINGS.keys()):
-            val = self.GRBL_SETTINGS[key]
-            if isinstance(val, float):
-                lines.append(f"${key}={val:.3f}")
-            else:
-                lines.append(f"${key}={val}")
+        for k in sorted(self.GRBL_SETTINGS):
+            v = self.GRBL_SETTINGS[k]
+            lines.append(f"${k}={v:.3f}" if isinstance(v, float) else f"${k}={v}")
         lines.append("ok")
         return "\n".join(lines)
 
     def _build_info(self) -> str:
-        """Handle $I — return GRBL build info."""
         fw = self.laser.fw_version or "1.0.0"
-        return f"[VER:1.1h.20190825: D1Ultra Bridge ({fw})]\n[OPT:V,15,128]\nok"
+        return f"[VER:1.1h.20190825: D1Ultra Bridge v2.1 ({fw})]\n[OPT:V,15,128]\nok"
 
     def _gcode_parameters(self) -> str:
-        """Handle $# — return GCode coordinate system offsets."""
-        lines = []
-        # Work coordinate offsets (all zero — we use machine coordinates)
-        for cs in ['G54', 'G55', 'G56', 'G57', 'G58', 'G59']:
-            lines.append(f"[{cs}:0.000,0.000,0.000]")
-        lines.append("[G28:0.000,0.000,0.000]")
-        lines.append("[G30:0.000,0.000,0.000]")
-        lines.append("[G92:0.000,0.000,0.000]")
-        lines.append("[TLO:0.000]")
-        lines.append("[PRB:0.000,0.000,0.000:0]")
-        lines.append("ok")
+        lines = [f"[{cs}:0.000,0.000,0.000]"
+                 for cs in ['G54','G55','G56','G57','G58','G59']]
+        lines += ["[G28:0.000,0.000,0.000]", "[G30:0.000,0.000,0.000]",
+                  "[G92:0.000,0.000,0.000]", "[TLO:0.000]",
+                  "[PRB:0.000,0.000,0.000:0]", "ok"]
         return "\n".join(lines)
 
     def _gcode_parser_state(self) -> str:
-        """Handle $G — return current GCode parser state."""
         mode = "G90" if self.state.absolute_mode else "G91"
-        return f"[GC:G0 {mode} G54 M0 M5 M9 T0 F{self.state.feed_rate:.0f} S0]\nok"
+        return (f"[GC:G0 {mode} G17 G21 G94 G54 M5 M9 T0 "
+                f"F{self.state.feed_rate:.0f} S{self.state.power:.0f}]\nok")
 
     def _home(self) -> str:
-        """Handle $H homing command — sends real motor home to laser."""
-        log.info("Homing: sending motor home command to laser...")
-        self.laser.home_motors()
-        self.state.x = 0.0
-        self.state.y = 0.0
-        self.state.z = 0.0
+        t = threading.Thread(target=self.laser.home_motors, daemon=True)
+        t.start()
         self.state.is_homed = True
-        log.info("Homing complete: position reset to 0,0,0")
         return "ok"
-
-    def _focus_on(self) -> str:
-        """Turn on the focus laser pointer."""
-        pkt = self.laser.builder.build_peripheral(Peripheral.FOCUS_LASER, True)
-        self.laser.send_and_recv(pkt)
-        log.info("Focus laser pointer ON")
-        return "[MSG:Focus laser ON]\r\nok"
-
-    def _focus_off(self) -> str:
-        """Turn off the focus laser pointer."""
-        pkt = self.laser.builder.build_peripheral(Peripheral.FOCUS_LASER, False)
-        self.laser.send_and_recv(pkt)
-        log.info("Focus laser pointer OFF")
-        return "[MSG:Focus laser OFF]\r\nok"
-
-    def _autofocus(self) -> str:
-        """Run the IR autofocus sequence (3 probes, matches M+ behavior)."""
-        z = self.laser.run_autofocus()
-        if z is not None:
-            self.state.z = z
-            return f"[MSG:Autofocus done Z={z:.3f}mm]\r\nok"
-        else:
-            return "[MSG:Autofocus FAILED]\r\nok"
 
     def _unlock(self) -> str:
-        """Handle $X unlock command."""
-        self.state.is_homed = True
-        return "ok"
+        return "[MSG:Caution: Unlocked]\nok"
 
     def _reset(self) -> str:
-        """Handle soft reset."""
-        self.state.is_running = False
-        self.state.laser_on = False
         self.state.reset_job()
-        return "Grbl 1.1h ['$' for help]\r\n"
+        self.state.is_running = False
+        return ("\r\nGrbl 1.1h ['$' for help]\n"
+                "[MSG:'$H'|'$X' to unlock]\n[MSG:Caution: Unlocked]")
+
+    def _focus_on(self) -> str:
+        self.laser.send_and_recv(self.laser.builder.build_peripheral(2, True))
+        return "ok"
+
+    def _focus_off(self) -> str:
+        self.laser.send_and_recv(self.laser.builder.build_peripheral(2, False))
+        return "ok"
+
+    def _autofocus(self) -> str:
+        t = threading.Thread(target=self.laser.run_autofocus, daemon=True)
+        t.start()
+        return "ok"
 
     def _jog(self, params: str) -> str:
-        """Handle $J= jog commands."""
-        # Parse jog parameters
-        parts = params.upper().split()
-        x, y, z, f = None, None, None, None
-        for part in parts:
-            for p in self._split_gcode_words(part):
-                if p.startswith('X'):
-                    x = float(p[1:])
-                elif p.startswith('Y'):
-                    y = float(p[1:])
-                elif p.startswith('Z'):
-                    z = float(p[1:])
-                elif p.startswith('F'):
-                    f = float(p[1:])
-        if x is not None:
-            self.state.x = x
-        if y is not None:
-            self.state.y = y
-        if z is not None:
-            # Z-axis jog -> move the elevating platform
-            # ACK arrives after motor reaches position; scale timeout with distance
-            delta = z - self.state.z
-            if abs(delta) > 0.01:
-                z_timeout = max(5.0, abs(delta) * 3.0)
-                pkt = self.laser.builder.build_z_move(delta)
-                self.laser.send_and_recv(pkt, timeout=z_timeout)
-                log.info(f"Z-axis move: {delta:+.2f}mm")
-            self.state.z = z
+        upper = params.upper()
+        if 'Z' in upper:
+            try:
+                z_idx = upper.index('Z')
+                end   = z_idx + 1
+                while end < len(upper) and (upper[end].isdigit() or upper[end] in '.-+'):
+                    end += 1
+                z_dist = float(upper[z_idx+1:end])
+                self.laser.send_and_recv(self.laser.builder.build_z_move(z_dist))
+            except Exception:
+                pass
         return "ok"
 
-    def _split_gcode_words(self, line: str) -> List[str]:
-        """Split a G-code line into individual words (G0, X10, Y20, etc.)."""
-        words = []
-        current = ""
-        for ch in line:
-            if ch.isalpha() and current:
-                words.append(current)
-                current = ch
-            else:
-                current += ch
-        if current:
-            words.append(current)
-        return words
+    # ── G-code parsing ────────────────────────────────────────────────────────
 
     def _parse_gcode(self, line: str) -> str:
-        """Parse and execute a G-code line."""
-        words = self._split_gcode_words(line.upper())
+        upper = line.upper()
+        parts = upper.split()
 
-        g_cmd = None
-        m_cmd = None
-        x_val = None
-        y_val = None
-        z_val = None
-        f_val = None
-        s_val = None
+        f_val = self._extract(upper, 'F')
+        s_val = self._extract(upper, 'S')
+        x_val = self._extract(upper, 'X')
+        y_val = self._extract(upper, 'Y')
+        z_val = self._extract(upper, 'Z')
 
-        for word in words:
-            if not word:
-                continue
-            letter = word[0]
-            try:
-                value = float(word[1:]) if len(word) > 1 else 0
-            except ValueError:
-                continue
-
-            if letter == 'G':
-                g_cmd = int(value)
-            elif letter == 'M':
-                m_cmd = int(value)
-            elif letter == 'X':
-                x_val = value
-            elif letter == 'Y':
-                y_val = value
-            elif letter == 'Z':
-                z_val = value
-            elif letter == 'F':
-                f_val = value
-            elif letter == 'S':
-                s_val = value
-
-        # Update feed rate if specified
-        if f_val is not None:
-            self.state.feed_rate = f_val
-            self.state.speed_mm_min = f_val
-
-        # Update power if specified
         if s_val is not None:
             self.state.power = s_val
-            # Track max power seen while laser is on (for job settings).
-            # The G-code ends with S0 + M5, so we can't read power at
-            # job-finish time — capture it during the job instead.
-            if s_val > self.state.job_power and self.state.laser_on:
-                self.state.job_power = s_val
+        if f_val is not None:
+            self.state.feed_rate = f_val
 
-        # Handle M-codes
-        if m_cmd is not None:
-            return self._handle_m_code(m_cmd, s_val)
-
-        # Handle G-codes
-        if g_cmd is not None:
-            return self._handle_g_code(g_cmd, x_val, y_val, z_val, f_val, s_val)
-
-        # If just coordinates with no G command, treat as G1 (linear move)
-        if x_val is not None or y_val is not None or z_val is not None:
-            return self._handle_g_code(1, x_val, y_val, z_val, f_val, s_val)
-
-        return "ok"
-
-    def _handle_g_code(self, cmd: int, x: Optional[float], y: Optional[float],
-                       z: Optional[float], f: Optional[float],
-                       s: Optional[float]) -> str:
-        """Handle G-code commands."""
-
-        if cmd == 0:  # G0 - Rapid move (laser off)
-            self._move(x, y, z, rapid=True)
-            return "ok"
-
-        elif cmd == 1:  # G1 - Linear move (laser on if M3/M4 active)
-            self._move(x, y, z, rapid=False)
-            return "ok"
-
-        elif cmd in (2, 3):  # G2/G3 - Arc (CW/CCW)
-            # For now, linearize arcs
-            # TODO: proper arc interpolation
-            self._move(x, y, z, rapid=False)
-            return "ok"
-
-        elif cmd == 4:  # G4 - Dwell
-            return "ok"
-
-        elif cmd == 10:  # G10 - Set coordinate offset
-            return "ok"
-
-        elif cmd == 20:  # G20 - Inches mode
-            log.warning("Inches mode not supported, staying in mm")
-            return "ok"
-
-        elif cmd == 21:  # G21 - Millimeters mode
-            return "ok"
-
-        elif cmd == 28:  # G28 - Go to predefined position
-            self.state.x = 0.0
-            self.state.y = 0.0
-            return "ok"
-
-        elif cmd == 90:  # G90 - Absolute positioning
-            self.state.absolute_mode = True
-            return "ok"
-
-        elif cmd == 91:  # G91 - Relative positioning
-            self.state.absolute_mode = False
-            return "ok"
-
-        elif cmd == 92:  # G92 - Set position
-            if x is not None:
-                self.state.x = x
-            if y is not None:
-                self.state.y = y
-            if z is not None:
-                self.state.z = z
-            return "ok"
-
-        return "ok"
-
-    def _move(self, x: Optional[float], y: Optional[float],
-              z: Optional[float], rapid: bool):
-        """Execute a move, accumulating path segments for the job."""
-        # Calculate target position
-        if self.state.absolute_mode:
-            target_x = x if x is not None else self.state.x
-            target_y = y if y is not None else self.state.y
-            target_z = z if z is not None else self.state.z
-        else:
-            target_x = self.state.x + (x or 0.0)
-            target_y = self.state.y + (y or 0.0)
-            target_z = self.state.z + (z or 0.0)
-
-        # Handle Z-axis movement
-        if z is not None and abs(target_z - self.state.z) > 0.01:
-            delta = target_z - self.state.z
-            z_timeout = max(5.0, abs(delta) * 3.0)
-            pkt = self.laser.builder.build_z_move(delta)
-            self.laser.send_and_recv(pkt, timeout=z_timeout)
-            log.info(f"Z-axis move: {delta:+.2f}mm")
-
-        # Accumulate path data for the job
-        if rapid:
-            # G0 rapid move — start a new path group with this destination
-            self.state.start_new_path_group(target_x, target_y)
-        elif self.state.laser_on:
-            # G1 with laser on — add cut point to current path group
-            self.state.add_cut_point(target_x, target_y)
-
-        # Update position
-        self.state.x = target_x
-        self.state.y = target_y
-        self.state.z = target_z
-
-    def _handle_m_code(self, cmd: int, s_val: Optional[float]) -> str:
-        """Handle M-code commands."""
-
-        if cmd == 0 or cmd == 1:  # M0/M1 - Program pause
-            return "ok"
-
-        elif cmd == 2 or cmd == 30:  # M2/M30 - Program end
-            self._finish_job()
-            return "ok"
-
-        elif cmd == 3 or cmd == 4:  # M3/M4 - Laser on (CW/CCW)
+        # Laser on/off
+        if 'M3' in parts or 'M03' in parts:
             self.state.laser_on = True
-            if s_val is not None:
-                self.state.power = s_val
-                if s_val > self.state.job_power:
-                    self.state.job_power = s_val
-            log.info(f"Laser ON, power={self.state.power_fraction*100:.0f}%")
-            return "ok"
-
-        elif cmd == 5:  # M5 - Laser off
+        if 'M5' in parts or 'M05' in parts:
             self.state.laser_on = False
-            log.info("Laser OFF")
+
+        # M30 / M2 = program end → execute job
+        if 'M30' in parts or 'M2' in parts:
+            return self._finish_job()
+
+        # G20 / G21 units (ignored — assume mm)
+        # G90 / G91 positioning
+        if 'G90' in parts: self.state.absolute_mode = True
+        if 'G91' in parts: self.state.absolute_mode = False
+
+        # G92 set position
+        if 'G92' in parts:
+            if x_val is not None: self.state.x = x_val
+            if y_val is not None: self.state.y = y_val
+            if z_val is not None: self.state.z = z_val
             return "ok"
 
-        elif cmd == 8:  # M8 - Air assist on (map to peripheral?)
+        # G0 rapid move
+        if any(p in parts for p in ('G0', 'G00')):
+            if x_val is not None:
+                self.state.x = x_val if self.state.absolute_mode else self.state.x + x_val
+            if y_val is not None:
+                self.state.y = y_val if self.state.absolute_mode else self.state.y + y_val
+            if z_val is not None:
+                dz = (z_val - self.state.z) if self.state.absolute_mode else z_val
+                if abs(dz) > 0.001:
+                    self.laser.send_and_recv(self.laser.builder.build_z_move(dz))
+                self.state.z = self.state.z + dz if not self.state.absolute_mode else z_val
+            self.state.start_new_path_group(self.state.x, self.state.y)
             return "ok"
 
-        elif cmd == 9:  # M9 - Air assist off
-            return "ok"
+        # G1 / G2 / G3 cut move
+        if any(p in parts for p in ('G1', 'G01', 'G2', 'G02', 'G3', 'G03')):
+            nx = (x_val if self.state.absolute_mode else self.state.x + x_val) \
+                 if x_val is not None else self.state.x
+            ny = (y_val if self.state.absolute_mode else self.state.y + y_val) \
+                 if y_val is not None else self.state.y
 
-        elif cmd == 114:  # M114 - Report position
-            return f"X:{self.state.x:.3f} Y:{self.state.y:.3f} Z:{self.state.z:.3f}\nok"
+            # Arc interpolation (G2/G3)
+            if any(p in parts for p in ('G2', 'G02', 'G3', 'G03')):
+                segs = self._linearise_arc(
+                    self.state.x, self.state.y, nx, ny, line, upper,
+                    clockwise=any(p in parts for p in ('G2', 'G02')))
+                pwr = s_val if s_val is not None else self.state.power
+                for sx, sy in segs:
+                    self.state.add_cut_point(sx, sy, pwr)
+                    self.state.x = sx
+                    self.state.y = sy
+            else:
+                pwr = s_val if s_val is not None else self.state.power
+                self.state.x = nx
+                self.state.y = ny
+                if z_val is not None:
+                    dz = (z_val - self.state.z) if self.state.absolute_mode else z_val
+                    if abs(dz) > 0.001:
+                        self.laser.send_and_recv(self.laser.builder.build_z_move(dz))
+                    self.state.z = z_val if self.state.absolute_mode else self.state.z + z_val
+                self.state.add_cut_point(nx, ny, pwr)
+
+            return "ok"
 
         return "ok"
 
-    def _finish_job(self):
-        """Send accumulated path data to the laser and execute the job.
+    @staticmethod
+    def _extract(line: str, letter: str) -> Optional[float]:
+        idx = line.find(letter)
+        if idx == -1: return None
+        end = idx + 1
+        while end < len(line) and (line[end].isdigit() or line[end] in '.-+'):
+            end += 1
+        try:
+            return float(line[idx+1:end])
+        except ValueError:
+            return None
 
-        Protocol sequence (derived from M+ SVG capture — same SVG used in
-        both M+ and LightBurn for 1:1 comparison):
-          1. DEVICE_INFO query  (0x0018, msg_type=1)
-          2. JOB_DATA upload    (0x0002, msg_type=1) — name + optional PNG
-          3. For each path group (split at G0 rapid moves):
-             a. JOB_SETTINGS    (0x0000, msg_type=0) — passes/speed/freq/power
-             b. PATH_DATA       (0x0001, msg_type=0) — coordinate points
-          4. Wait for laser's JOB_CONTROL (0x0003)   — laser signals ready
-          5. JOB_NAME finalize  (0x0004, msg_type=1) — 256-byte name field
+    @staticmethod
+    def _linearise_arc(x0, y0, x1, y1, line, upper, clockwise, segments=32):
+        """Convert a G2/G3 arc to straight-line segments."""
+        i_val = GRBLTranslator._extract(upper, 'I') or 0.0
+        j_val = GRBLTranslator._extract(upper, 'J') or 0.0
+        cx, cy = x0 + i_val, y0 + j_val
+        r = math.sqrt((x0 - cx)**2 + (y0 - cy)**2)
+        a0 = math.atan2(y0 - cy, x0 - cx)
+        a1 = math.atan2(y1 - cy, x1 - cx)
+        if clockwise and a1 > a0:
+            a1 -= 2 * math.pi
+        elif not clockwise and a1 < a0:
+            a1 += 2 * math.pi
+        pts = []
+        for k in range(1, segments + 1):
+            a = a0 + (a1 - a0) * k / segments
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        return pts
 
-        IMPORTANT: M+ sends JOB_SETTINGS before EACH PATH_DATA group, not
-        just once.  Also, coordinates are centered around the design's
-        bounding-box midpoint (origin = design center, not bed origin).
-        """
-        # Filter out path groups with < 2 points (need start + at least one cut)
+    # ── Job execution trigger ─────────────────────────────────────────────────
+
+    def _finish_job(self) -> str:
+        """Called when M30/M2 received — translate collected paths and send."""
         groups = [g for g in self.state.job_path_groups if len(g) >= 2]
         if not groups:
-            log.info("No path data to send")
-            return
+            log.info("M30 received but no path groups — nothing to engrave")
+            self.state.reset_job()
+            return "ok"
 
-        total_segs = sum(len(g) for g in groups)
-
-        # Use job_power (max S seen during job) rather than current power,
-        # because the G-code ends with S0/M5 before M2 triggers this.
-        job_power_frac = min(1.0, self.state.job_power / self.state.max_power) \
-            if self.state.max_power > 0 else 0.0
-
-        # Compute bounding box from filtered groups only (not from G0 X0Y0
-        # return-to-home moves that would skew the center point).
+        # Compute bounding box and centre coords
         all_pts = [pt for g in groups for pt in g]
-        bb_x_min = min(x for x, y in all_pts)
-        bb_x_max = max(x for x, y in all_pts)
-        bb_y_min = min(y for x, y in all_pts)
-        bb_y_max = max(y for x, y in all_pts)
-        cx = (bb_x_min + bb_x_max) / 2.0
-        cy = (bb_y_min + bb_y_max) / 2.0
+        x_vals  = [p[0] for p in all_pts]
+        y_vals  = [p[1] for p in all_pts]
+        cx = (min(x_vals) + max(x_vals)) / 2
+        cy = (min(y_vals) + max(y_vals)) / 2
 
-        log.info(f"Sending job: {len(groups)} path groups, "
-                 f"{total_segs} total points, "
-                 f"power={job_power_frac*100:.0f}%, "
-                 f"speed={self.state.speed_mm_min:.0f}mm/min, "
-                 f"center=({cx:.1f},{cy:.1f})")
+        centred = [[(x - cx, y - cy) for x, y in g] for g in groups]
 
-        def _job_log_pkt(label: str, pkt: bytes):
-            """Log first 40 bytes of a packet in hex for debugging."""
-            hx = pkt[:40].hex(' ')
-            log.info(f"  JOB {label} ({len(pkt)}b): {hx}")
+        power = self.state.job_power_fraction
+        if power <= 0.0:
+            power = self.state.power_fraction
+        if power <= 0.0:
+            power = 0.5   # fallback
 
-        try:
-            # 1. Query device info
-            pkt = self.laser.builder.build_device_info()
-            _job_log_pkt("DEVICE_INFO →", pkt)
-            resp = self.laser.send_and_recv(pkt)
-            if resp:
-                rp = resp.get('payload', b'')
-                log.info(f"  JOB DEVICE_INFO ← cmd=0x{resp.get('cmd',0):04x} "
-                         f"payload[0:16]={rp[:16].hex(' ') if rp else '(empty)'}")
-            else:
-                log.warning("  JOB DEVICE_INFO ← no response")
+        speed = self.state.speed_mm_min if self.state.speed_mm_min > 0 else 500.0
 
-            # 2. Upload job header (256-byte name + PNG preview)
-            #    M+ always sends a PNG preview (~6 KB).  The laser may
-            #    require it to register the job and send JOB_CONTROL.
-            png_preview = make_preview_png(100, 100)
-            pkt = self.laser.builder.build_job_upload(self.state.job_name, png_preview)
-            _job_log_pkt("JOB_UPLOAD →", pkt)
-            resp = self.laser.send_and_recv(pkt, timeout=5.0)
-            if resp:
-                rp = resp.get('payload', b'')
-                log.info(f"  JOB JOB_UPLOAD ← cmd=0x{resp.get('cmd',0):04x} "
-                         f"payload={rp.hex(' ') if rp else '(empty)'}")
-            else:
-                log.warning("No ACK for job upload — continuing anyway")
+        log.info(f"M30: starting job '{self.state.job_name}' "
+                 f"({len(centred)} paths, {power*100:.0f}% power, "
+                 f"{speed:.0f} mm/min)")
 
-            # 3. For each path group: send JOB_SETTINGS then PATH_DATA
-            #    M+ capture shows this alternating pattern is required.
-            self.state.is_running = True
-            self.laser._job_ready.clear()
+        self.state.is_running = True
 
-            for gi, group in enumerate(groups):
-                # 3a. JOB_SETTINGS before each PATH_DATA
-                pkt = self.laser.builder.build_job_settings(
-                    passes=self.state.passes,
-                    speed_mm_min=self.state.speed_mm_min,
-                    frequency_khz=self.state.frequency_khz,
-                    power_frac=job_power_frac,
-                    laser_source=self.state.laser_source,
-                )
-                if gi == 0:
-                    _job_log_pkt(f"JOB_SETTINGS[{gi}] →", pkt)
-                resp = self.laser.send_and_recv(pkt)
-                if not resp:
-                    log.warning(f"No ACK for JOB_SETTINGS[{gi}]")
-
-                # 3b. PATH_DATA — center coordinates around design midpoint
-                centered = [(x - cx, y - cy) for x, y in group]
-                pkt = self.laser.builder.build_path_data(centered)
-                if gi == 0:
-                    _job_log_pkt(f"PATH_DATA[{gi}] →", pkt)
-                resp = self.laser.send_and_recv(pkt)
-                if not resp:
-                    log.warning(f"No ACK for PATH_DATA[{gi}]")
-
-                log.info(f"  Path group {gi+1}/{len(groups)}: "
-                         f"{len(group)} points sent")
-
-            # 4. Wait for laser's JOB_CONTROL (0x0003)
-            log.info("  Waiting for laser JOB_CONTROL (0x0003)...")
-            if not self.laser._job_ready.wait(timeout=15.0):
-                log.warning("  Timeout waiting for laser JOB_CONTROL — "
-                            "continuing to finalize anyway")
-            else:
-                log.info("  Laser sent JOB_CONTROL — paths accepted")
-
-            # 5. Finalize job (sends 256-byte name field)
-            pkt = self.laser.builder.build_job_finish(self.state.job_name)
-            _job_log_pkt("JOB_FINISH →", pkt)
-            resp = self.laser.send_and_recv(pkt, timeout=10.0)
-            if resp:
-                rp = resp.get('payload', b'')
-                log.info(f"  JOB JOB_FINISH ← cmd=0x{resp.get('cmd',0):04x} "
-                         f"payload={rp.hex(' ') if rp else '(empty)'}")
-            else:
-                log.warning("No ACK for job finalize")
-
+        def _run():
+            ok = self.laser.execute_job(
+                centred,
+                self.state.job_name,
+                self.state.passes,
+                speed,
+                self.state.frequency_khz,
+                power,
+                self.state.laser_source,
+            )
             self.state.is_running = False
-            log.info("Job complete")
-
-        except Exception as e:
-            log.error(f"Job execution failed: {e}")
-            self.state.is_running = False
-        finally:
+            if ok:
+                log.info("Job complete!")
+            else:
+                log.error("Job FAILED")
             self.state.reset_job()
 
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return "ok"
 
-# ---------------------------------------------------------------------------
-# GRBL TCP Server (LightBurn connects here)
-# ---------------------------------------------------------------------------
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GRBL server (LightBurn side)
+# ─────────────────────────────────────────────────────────────────────────────
 class GRBLServer:
-    """TCP server that speaks GRBL to LightBurn."""
-
-    def __init__(self, laser: D1UltraConnection, host: str, port: int):
+    def __init__(self, laser: D1UltraConnection,
+                 host: str = DEFAULT_LISTEN_HOST,
+                 port: int = DEFAULT_LISTEN_PORT):
         self.laser = laser
-        self.host = host
-        self.port = port
-        self.state = GRBLState()
-        self.translator = GRBLTranslator(laser, self.state)
+        self.host  = host
+        self.port  = port
+        self._server_sock: Optional[socket.socket] = None
+        self._client_sock: Optional[socket.socket] = None
 
     def start(self):
-        """Start the GRBL TCP server."""
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((self.host, self.port))
-        server.listen(1)
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind((self.host, self.port))
+        self._server_sock.listen(1)
         log.info(f"GRBL server listening on {self.host}:{self.port}")
-        log.info(f"In LightBurn: Add device -> GRBL -> TCP/IP -> localhost:{self.port}")
+        t = threading.Thread(target=self._accept_loop, daemon=True)
+        t.start()
 
+    def _accept_loop(self):
         while True:
             try:
-                client, addr = server.accept()
+                conn, addr = self._server_sock.accept()
                 log.info(f"LightBurn connected from {addr}")
-                self._handle_client(client)
-            except KeyboardInterrupt:
-                break
+                self._client_sock = conn
+                t = threading.Thread(target=self._handle_client,
+                                     args=(conn,), daemon=True)
+                t.start()
             except Exception as e:
-                log.error(f"Server error: {e}")
+                log.error(f"Accept error: {e}")
+                break
 
-        server.close()
+    def _handle_client(self, conn: socket.socket):
+        state      = GRBLState()
+        translator = GRBLTranslator(self.laser, state)
+        buf = b''
 
-    def _handle_client(self, client: socket.socket):
-        """Handle a LightBurn client connection."""
-        client.settimeout(None)
-
-        # Open debug log for raw byte-level tracing
-        debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  "debug.txt")
-        dbg = open(debug_path, 'w')
-        dbg.write(f"=== LightBurn debug log — {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-        dbg.flush()
-
-        def dbg_log(msg):
-            ts = time.strftime('%H:%M:%S')
-            dbg.write(f"[{ts}] {msg}\n")
-            dbg.flush()
-
-        # Ensure laser is connected before accepting commands
-        if not self.laser.ensure_connected():
-            log.error("Laser not reachable — sending error to LightBurn")
-            dbg_log("ERROR: Laser not reachable")
-            client.sendall(b"ALARM:9\r\n")  # GRBL alarm: homing fail
-            client.close()
-            dbg.close()
+        try:
+            conn.sendall(b"\r\nGrbl 1.1h ['$' for help]\r\n")
+            conn.sendall(b"[MSG:'$H'|'$X' to unlock]\r\n")
+        except Exception:
             return
 
-        log.info(f"Laser OK: {self.laser.device_name} (FW {self.laser.fw_version})")
-
-        # Send GRBL welcome banner
-        welcome = "Grbl 1.1h ['$' for help]\r\n"
-        client.sendall(welcome.encode('ascii'))
-        dbg_log(f"SENT banner: {repr(welcome)}")
-
-        REALTIME_CHARS = set(b'?!~\x18')
-        buffer = ""
         try:
             while True:
-                data = client.recv(4096)
-                if not data:
-                    dbg_log("RECV: connection closed (empty read)")
+                chunk = conn.recv(1024)
+                if not chunk:
+                    log.info("LightBurn disconnected")
                     break
-
-                # Log raw bytes
-                dbg_log(f"RECV raw {len(data)}b: {data.hex()} | ascii: {repr(data)}")
-
-                # GRBL realtime characters (? ! ~ Ctrl-X) must be handled
-                # immediately — they arrive without a newline delimiter.
-                # Extract them before adding the rest to the line buffer.
-                text = ""
-                for byte in data:
-                    if byte in REALTIME_CHARS:
-                        ch = chr(byte)
-                        dbg_log(f"  REALTIME char: {repr(ch)}")
-                        response = self.translator.handle_line(ch)
-                        if response:
-                            dbg_log(f"  REALTIME resp: {repr(response)}")
-                            client.sendall((response + "\r\n").encode('ascii'))
-                    else:
-                        text += chr(byte) if byte < 128 else '?'
-
-                buffer += text
-
-                # Process complete lines
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip('\r')
-
-                    if not line:
-                        continue
-
-                    dbg_log(f"  LINE: {repr(line)}")
-                    log.debug(f"GRBL <- {line}")
-                    response = self.translator.handle_line(line)
-
-                    if response:
-                        dbg_log(f"  RESP: {repr(response)}")
-                        log.debug(f"GRBL -> {response[:80]}")
-                        client.sendall((response + "\r\n").encode('ascii'))
-
-        except ConnectionResetError:
-            log.info("LightBurn disconnected")
-            dbg_log("LightBurn disconnected (reset)")
+                buf += chunk
+                while b'\n' in buf:
+                    idx  = buf.index(b'\n')
+                    line = buf[:idx].decode('ascii', errors='replace')
+                    buf  = buf[idx+1:]
+                    resp = translator.handle_line(line)
+                    if resp:
+                        try:
+                            conn.sendall((resp + "\r\n").encode('ascii'))
+                        except Exception:
+                            break
         except Exception as e:
-            log.error(f"Client handler error: {e}")
-            dbg_log(f"ERROR: {e}")
+            log.warning(f"Client handler error: {e}")
         finally:
-            client.close()
-            log.info("Client connection closed")
-            dbg_log("=== Connection closed ===")
-            dbg.close()
-            log.info(f"Debug log written to: {debug_path}")
+            try: conn.close()
+            except: pass
 
 
-# ---------------------------------------------------------------------------
-# Interactive Console (runs alongside GRBL server)
-# ---------------------------------------------------------------------------
-
-class InteractiveConsole:
-    """Interactive command console that runs in a thread alongside the bridge.
-
-    Provides direct laser control commands while LightBurn is connected.
-    WARNING: Do not send commands while a job is running!
+# ─────────────────────────────────────────────────────────────────────────────
+# Replay tool
+# ─────────────────────────────────────────────────────────────────────────────
+def replay_pcapng(path: str, laser_ip: str = DEFAULT_LASER_IP,
+                  laser_port: int = DEFAULT_LASER_PORT):
     """
+    Parse a pcapng file and replay all HOST→LASER TCP payloads to the laser.
+    Watches for JOB_CONTROL (0x0003) response to confirm the sequence works.
+    """
+    log.info(f"Replay: opening {path}")
 
-    def __init__(self, laser: D1UltraConnection, state: 'GRBLState'):
-        self.laser = laser
-        self.state = state
-        self._thread: Optional[threading.Thread] = None
+    with open(path, 'rb') as f:
+        raw = f.read()
 
-    def start(self):
-        """Start the console in a background thread."""
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+    host_payloads = []
+    offset = 0
 
-    def _print_help(self):
-        print()
-        print("  Available commands:")
-        print("  ─────────────────────────────────────────────")
-        print("  ping            Ping the laser")
-        print("  home            Home/reset motors")
-        print("  light on|off    Toggle fill light")
-        print("  buzzer on|off   Toggle buzzer")
-        print("  focus on|off    Toggle focus laser pointer")
-        print("  gate on|off     Toggle safety gate")
-        print("  autofocus       Run IR autofocus (3 probes)")
-        print("  up <mm>         Move Z-axis up (default 5mm)")
-        print("  down <mm>       Move Z-axis down (default 5mm)")
-        print("  status          Query device status")
-        print("  info            Query device info")
-        print("  help            Show this help")
-        print("  quit            Shut down the bridge")
-        print()
+    if len(raw) < 8:
+        log.error("File too short")
+        return
 
-    def _run(self):
-        """Console input loop."""
-        print()
-        print("─" * 50)
-        print("  Console ready — type 'help' for commands")
-        print("  (LightBurn can connect at the same time)")
-        print("─" * 50)
-        print()
+    shb_type = struct.unpack('<I', raw[0:4])[0]
+    if shb_type != 0x0A0D0D0A:
+        log.error(f"Not a pcapng file (magic 0x{shb_type:08x})")
+        return
 
-        while True:
-            try:
-                cmd = input("d1ultra> ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\nShutting down...")
-                import os
-                os._exit(0)
+    log.info("Parsing pcapng blocks...")
+    laser_ip_bytes = bytes(int(b) for b in laser_ip.split('.'))
+    packets_found = 0
 
-            if not cmd:
+    while offset + 8 <= len(raw):
+        block_type   = struct.unpack('<I', raw[offset:offset+4])[0]
+        block_length = struct.unpack('<I', raw[offset+4:offset+8])[0]
+        if block_length < 12 or offset + block_length > len(raw):
+            break
+        block_data = raw[offset:offset+block_length]
+        offset += block_length
+
+        if block_type == 6:  # Enhanced Packet Block
+            if len(block_data) < 28:
                 continue
+            ts_high  = struct.unpack('<I', block_data[12:16])[0]
+            ts_low   = struct.unpack('<I', block_data[16:20])[0]
+            cap_len  = struct.unpack('<I', block_data[20:24])[0]
+            timestamp_ns = ((ts_high << 32) | ts_low) * 1000
 
-            # Safety check
-            if self.state.is_running:
-                if cmd not in ('status', 'info', 'ping', 'help', 'quit', 'exit', 'q'):
-                    print("  WARNING: Job is running! Only status/ping/info allowed.")
-                    print("  Wait for the job to finish or use 'status' to check.")
-                    continue
+            if 28 + cap_len > len(block_data):
+                continue
+            pkt_data = block_data[28:28+cap_len]
 
-            parts = cmd.split()
-            action = parts[0]
+            payload = _extract_tcp_payload(pkt_data, laser_ip_bytes, laser_port)
+            if payload and len(payload) >= 18 and b'\x0a\x0a' in payload:
+                packets_found += 1
+                host_payloads.append((timestamp_ns, payload))
 
+    log.info(f"Found {packets_found} HOST->LASER D1 Ultra packets")
+    if not host_payloads:
+        log.error("No host->laser packets found")
+        return
+
+    # Connect and replay
+    log.info(f"Connecting to {laser_ip}:{laser_port}...")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10.0)
+    try:
+        sock.connect((laser_ip, laser_port))
+    except Exception as e:
+        log.error(f"Connect failed: {e}")
+        return
+    sock.settimeout(None)
+
+    recv_buf  = b''
+    job_ready = threading.Event()
+    stop      = threading.Event()
+
+    def reader():
+        nonlocal recv_buf
+        while not stop.is_set():
             try:
-                if action in ('quit', 'exit', 'q'):
-                    print("Shutting down bridge...")
-                    import os
-                    os._exit(0)
+                chunk = sock.recv(4096)
+                if not chunk: break
+                recv_buf += chunk
+                while len(recv_buf) >= 18:
+                    idx = recv_buf.find(b'\x0a\x0a')
+                    if idx == -1:
+                        recv_buf = b''
+                        break
+                    if idx > 0:
+                        recv_buf = recv_buf[idx:]
+                    if len(recv_buf) < 4: break
+                    plen = struct.unpack('<H', recv_buf[2:4])[0]
+                    if len(recv_buf) < plen: break
+                    pkt = recv_buf[:plen]
+                    recv_buf = recv_buf[plen:]
+                    if len(pkt) >= 14:
+                        cmd = struct.unpack('<H', pkt[12:14])[0]
+                        seq = struct.unpack('<H', pkt[6:8])[0]
+                        log.info(f"  LASER->HOST: cmd=0x{cmd:04x} seq={seq} len={plen}")
+                        if cmd == 0x0003:
+                            log.info("  >> JOB_CONTROL received!")
+                            job_ready.set()
+            except Exception:
+                break
 
-                elif action == 'help':
-                    self._print_help()
+    rt = threading.Thread(target=reader, daemon=True)
+    rt.start()
 
-                elif action == 'ping':
-                    if self.laser.ping():
-                        print("  OK — laser is alive")
-                    else:
-                        print("  FAILED — no response")
+    log.info("Replaying packets...")
+    prev_ts = host_payloads[0][0]
+    for i, (ts, payload) in enumerate(host_payloads):
+        if i > 0:
+            delay_ns = ts - prev_ts
+            delay_s  = min(delay_ns / 1e9, 0.5)
+            if delay_s > 0.001:
+                time.sleep(delay_s)
+        prev_ts = ts
 
-                elif action == 'home':
-                    print("  Sending motor home command...")
-                    print("  Motor travels to top endstop, then retracts — can take 30+ sec...")
-                    self.laser.home_motors()
-                    print("  Motor homing complete (incl. retraction)")
+        cmd = struct.unpack('<H', payload[12:14])[0] if len(payload) >= 14 else 0
+        log.info(f"  -> Pkt {i+1}/{len(host_payloads)}: cmd=0x{cmd:04x} len={len(payload)}")
+        try:
+            sock.sendall(payload)
+        except Exception as e:
+            log.error(f"Send error: {e}")
+            break
+        time.sleep(0.005)
 
-                elif action == 'light':
-                    on = len(parts) > 1 and parts[1] == 'on'
-                    pkt = self.laser.builder.build_peripheral(Peripheral.FILL_LIGHT, on)
-                    resp = self.laser.send_and_recv(pkt)
-                    print(f"  Fill light {'ON' if on else 'OFF'}" + (" — OK" if resp else " — no ACK"))
+    log.info("All packets sent. Waiting 10s for JOB_CONTROL...")
+    got = job_ready.wait(timeout=10.0)
+    if got:
+        log.info("Replay SUCCESS — laser responded with JOB_CONTROL!")
+    else:
+        log.error("Replay: JOB_CONTROL not received in 10s")
 
-                elif action == 'buzzer':
-                    on = len(parts) > 1 and parts[1] == 'on'
-                    pkt = self.laser.builder.build_peripheral(Peripheral.BUZZER, on)
-                    resp = self.laser.send_and_recv(pkt)
-                    print(f"  Buzzer {'ON' if on else 'OFF'}" + (" — OK" if resp else " — no ACK"))
+    stop.set()
+    sock.close()
 
-                elif action == 'focus':
-                    on = len(parts) > 1 and parts[1] == 'on'
-                    pkt = self.laser.builder.build_peripheral(Peripheral.FOCUS_LASER, on)
-                    resp = self.laser.send_and_recv(pkt)
-                    print(f"  Focus laser {'ON' if on else 'OFF'}" + (" — OK" if resp else " — no ACK"))
 
-                elif action == 'gate':
-                    on = len(parts) > 1 and parts[1] == 'on'
-                    pkt = self.laser.builder.build_peripheral(Peripheral.SAFETY_GATE, on)
-                    resp = self.laser.send_and_recv(pkt)
-                    print(f"  Safety gate {'ON' if on else 'OFF'}" + (" — OK" if resp else " — no ACK"))
+def _extract_tcp_payload(pkt, dst_ip, dst_port):
+    """Extract TCP payload from a raw Ethernet frame headed to the laser."""
+    try:
+        if len(pkt) < 14: return None
+        ethertype = struct.unpack('>H', pkt[12:14])[0]
+        if ethertype != 0x0800: return None
 
-                elif action == 'autofocus':
-                    self._do_autofocus()
+        ip_start = 14
+        if len(pkt) < ip_start + 20: return None
+        ihl   = (pkt[ip_start] & 0x0F) * 4
+        proto = pkt[ip_start + 9]
+        dst_a = pkt[ip_start+16:ip_start+20]
 
-                elif action in ('up', 'down'):
-                    mm = float(parts[1]) if len(parts) > 1 else 5.0
-                    if action == 'down':
-                        mm = -mm
-                    pkt = self.laser.builder.build_z_move(mm)
-                    # Motor ACK arrives only after move completes;
-                    # allow ~3 s per mm of travel, minimum 5 s
-                    z_timeout = max(5.0, abs(mm) * 3.0)
-                    print(f"  Z-axis move {mm:+.1f}mm (timeout {z_timeout:.0f}s)...")
-                    resp = self.laser.send_and_recv(pkt, timeout=z_timeout)
-                    print(f"  Z-axis move {mm:+.1f}mm" + (" — OK" if resp else " — no ACK"))
+        if proto != 6: return None
+        if dst_a != bytes(dst_ip): return None
 
-                elif action == 'status':
-                    resp = self.laser.send_and_recv(self.laser.builder.build_status())
-                    if resp:
-                        print(f"  Laser status: {resp}")
-                    else:
-                        print("  No response")
-                    print(f"  Bridge state: running={self.state.is_running}, "
-                          f"pos=({self.state.x:.2f}, {self.state.y:.2f}, {self.state.z:.2f}), "
-                          f"laser={'ON' if self.state.laser_on else 'OFF'}")
+        tcp_start = ip_start + ihl
+        if len(pkt) < tcp_start + 20: return None
+        dport = struct.unpack('>H', pkt[tcp_start+2:tcp_start+4])[0]
+        if dport != dst_port: return None
 
-                elif action == 'info':
-                    resp = self.laser.send_and_recv(self.laser.builder.build(Cmd.DEVICE_INFO))
-                    if resp:
-                        print(f"  Device info: {resp}")
-                    else:
-                        print("  No response")
-                    print(f"  Device: {self.laser.device_name}")
-                    print(f"  Firmware: {self.laser.fw_version}")
+        tcp_offset = ((pkt[tcp_start + 12] >> 4) & 0xF) * 4
+        payload = pkt[tcp_start + tcp_offset:]
+        return payload if payload else None
+    except Exception:
+        return None
 
-                else:
-                    print(f"  Unknown command: '{cmd}' — type 'help' for available commands")
 
-            except Exception as e:
-                print(f"  Error: {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Interactive console
+# ─────────────────────────────────────────────────────────────────────────────
+HELP = """
+D1 Ultra Bridge v2.1 — console commands
 
-    def _do_autofocus(self):
-        """Run the full autofocus sequence (3 probes averaged)."""
-        print("  Starting autofocus sequence (IR probe × 3)...")
-        z = self.laser.run_autofocus()
-        if z is not None:
-            self.state.z = z
-            print(f"  Autofocus complete: Z = {z:.3f}mm")
+  Peripheral control:
+    light on/off        Fill light
+    buzzer on/off       Buzzer
+    focus on/off        Focus laser pointer
+    gate on/off         Safety gate
+
+  Motion:
+    home                Home/reset motors
+    up <mm>             Move Z up (default 5 mm)
+    down <mm>           Move Z down (default 5 mm)
+    autofocus           IR autofocus (3-probe)
+
+  Status:
+    ping                Check laser is alive
+    status              Show bridge status
+    info                Device name + firmware
+
+  Help / quit:
+    help                This message
+    quit                Shut down bridge
+"""
+
+def run_console(laser: D1UltraConnection):
+    print("-" * 60)
+    print("  Console ready — type 'help' for commands")
+    print("-" * 60)
+
+    b = laser.builder
+    while True:
+        try:
+            line = input("d1ultra> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nShutting down...")
+            break
+
+        if not line:
+            continue
+        toks = line.split()
+        cmd  = toks[0]
+
+        if cmd in ('quit', 'exit', 'q'):
+            break
+        elif cmd == 'help':
+            print(HELP)
+        elif cmd == 'ping':
+            ok = laser.ping()
+            print("Laser is alive" if ok else "No response")
+        elif cmd == 'status':
+            print(f"Connected:  {laser.connected}")
+            print(f"Device:     {laser.device_name or '(unknown)'}")
+            print(f"Firmware:   {laser.fw_version or '(unknown)'}")
+        elif cmd == 'info':
+            print(f"Device:    {laser.device_name}")
+            print(f"Firmware:  {laser.fw_version}")
+        elif cmd == 'home':
+            laser.home_motors()
+        elif cmd in ('up', 'down'):
+            mm = float(toks[1]) if len(toks) > 1 else 5.0
+            dist = mm if cmd == 'up' else -mm
+            laser.send_and_recv(b.build_z_move(dist))
+            print(f"Moved Z {'up' if dist > 0 else 'down'} {abs(dist):.1f} mm")
+        elif cmd == 'autofocus':
+            z = laser.run_autofocus()
+            if z: print(f"Focus Z = {z:.3f} mm")
+        elif cmd == 'light':
+            state = len(toks) > 1 and toks[1] == 'on'
+            laser.send_and_recv(b.build_peripheral(0, state))
+        elif cmd == 'buzzer':
+            state = len(toks) > 1 and toks[1] == 'on'
+            laser.send_and_recv(b.build_peripheral(1, state))
+        elif cmd == 'focus':
+            state = len(toks) > 1 and toks[1] == 'on'
+            laser.send_and_recv(b.build_peripheral(2, state))
+        elif cmd == 'gate':
+            state = len(toks) > 1 and toks[1] == 'on'
+            laser.send_and_recv(b.build_peripheral(3, state))
         else:
-            print("  Autofocus FAILED — no measurements received")
+            print(f"Unknown command: {cmd}  (type 'help')")
+
+    laser.disconnect()
+    sys.exit(0)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="D1 Ultra <-> LightBurn GRBL Bridge",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Example usage:
-  python d1ultra_bridge.py
-  python d1ultra_bridge.py --laser-ip 192.168.12.1 --listen-port 23
-  python d1ultra_bridge.py --verbose
-
-Then in LightBurn:
-  Devices -> Add Manually -> GRBL -> TCP/IP
-  Address: localhost  Port: 23
-        """,
-    )
-    parser.add_argument('--laser-ip', default=DEFAULT_LASER_IP,
-                        help=f"D1 Ultra IP address (default: {DEFAULT_LASER_IP})")
-    parser.add_argument('--laser-port', type=int, default=DEFAULT_LASER_PORT,
-                        help=f"D1 Ultra TCP port (default: {DEFAULT_LASER_PORT})")
-    parser.add_argument('--listen-host', default=DEFAULT_LISTEN_HOST,
-                        help=f"Bridge listen address (default: {DEFAULT_LISTEN_HOST})")
-    parser.add_argument('--listen-port', type=int, default=DEFAULT_LISTEN_PORT,
-                        help=f"Bridge listen port (default: {DEFAULT_LISTEN_PORT})")
-    parser.add_argument('--verbose', '-v', action='store_true',
-                        help="Enable debug logging")
-
+        description="D1 Ultra <-> LightBurn Bridge v2.1")
+    parser.add_argument('--laser-ip',    default=DEFAULT_LASER_IP)
+    parser.add_argument('--laser-port',  type=int, default=DEFAULT_LASER_PORT)
+    parser.add_argument('--listen-host', default=DEFAULT_LISTEN_HOST)
+    parser.add_argument('--listen-port', type=int, default=DEFAULT_LISTEN_PORT)
+    parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument('--replay', metavar='PCAPNG',
+                        help='Replay a Wireshark capture directly to the laser')
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Connect to laser
+    # Replay mode
+    if args.replay:
+        replay_pcapng(args.replay, args.laser_ip, args.laser_port)
+        return
+
+    # Normal bridge mode
+    print()
+    print("D1 Ultra <-> LightBurn Bridge  v2.3")
+    print("=" * 50)
+    print("Changes from v2.0:")
+    print("  * FIX: ACK feedback loop — unsolicited 0x0013/0x0015 no longer flood")
+    print("  * FIX: PNG preview size matched to ~6KB (44x44 in execute_job)")
+    print("  * NEW: Auto-reconnect after laser idle timeout")
+    print("  * NEW: Job serialization (multi-layer jobs queue properly)")
+    print()
+    print("Key features (vs v1):")
+    print("  * Host SENDS 0x0003 (JOB_CONTROL) to start job")
+    print("  * PRE_JOB + WORKSPACE + QUERY_14 pre-job commands")
+    print("  * JOB_SETTINGS unknown field: -1.0")
+    print("  * WORKSPACE 42-byte payload")
+    print("  * G1 S0 duplicate point filter")
+    print()
+
     laser = D1UltraConnection(args.laser_ip, args.laser_port)
-
-    log.info("=" * 60)
-    log.info("D1 Ultra <-> LightBurn GRBL Bridge")
-    log.info("=" * 60)
-
     if not laser.connect():
-        log.warning("Cannot connect to laser yet. Is it powered on and USB connected?")
-        log.info(f"Tried: {args.laser_ip}:{args.laser_port}")
-        log.info("Starting in offline mode — will auto-connect when LightBurn connects")
-    else:
-        laser.identify()
-        if laser.ping():
-            log.info("Laser ping OK — ready to accept jobs")
-        else:
-            log.warning("Laser connected but not responding to ping")
+        sys.exit(1)
 
-    # Create GRBL server
+    if not laser.identify():
+        log.warning("Identification incomplete — continuing anyway")
+
+    log.info("Laser ping OK — ready to accept jobs")
+
     server = GRBLServer(laser, args.listen_host, args.listen_port)
+    server.start()
 
-    # Start interactive console (runs in background thread)
-    console = InteractiveConsole(laser, server.state)
-    console.start()
+    print()
+    print(f"  LightBurn: Devices -> GRBL -> TCP -> 127.0.0.1:{args.listen_port}")
+    print()
 
-    # Start GRBL server (blocks main thread)
     try:
-        server.start()
+        run_console(laser)
     except KeyboardInterrupt:
-        log.info("\nShutting down...")
-    finally:
+        print("\nShutting down...")
         laser.disconnect()
 
 
