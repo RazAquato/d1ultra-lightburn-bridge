@@ -1,0 +1,18 @@
+# Testing workspace — not shipped to GitHub
+temp/
+
+# Python
+__pycache__/
+*.pyc
+
+# Debug output
+debug.txt
+
+# Editor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

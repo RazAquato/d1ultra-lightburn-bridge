@@ -1,163 +1,146 @@
-# D1 Ultra LightBurn Bridge — Project Status
+# D1 Ultra LightBurn Bridge — Project Context for Claude Code
+
+This file gives Claude Code the context it needs to work on this project effectively.
+For the public protocol spec, see PROTOCOL.md. For setup instructions, see README.md.
 
 ## What This Is
 
-A Python bridge that translates GRBL commands from LightBurn into the Hansmaker D1 Ultra's proprietary binary protocol over TCP port 6000. The goal is to let LightBurn control the D1 Ultra directly, since Hansmaker only provides their own M+ software.
+A reverse-engineered bridge between LightBurn and the Hansmaker D1 Ultra laser engraver.
+Two approaches exist:
+
+1. **GRBL bridge** (`NOTTESTED_d1ultra_bridge_v2.py`) — LightBurn speaks GRBL over TCP, the bridge
+   translates to the D1 Ultra's binary protocol. Works today for basic engraving.
+   Missing galvo-specific features (live framing, split marking, cylinder correction).
+
+2. **RPi Zero JCZ bridge** (`NOTDONE_rpi_zero_bridge/`) — A Raspberry Pi Zero presents itself as a
+   BJJCZ galvo controller (VID 0x9588, PID 0x9899) over USB. LightBurn sends native JCZ
+   commands, the Pi translates to D1 Ultra binary protocol over TCP. This enables full galvo
+   features. Experimental, not yet tested on hardware.
 
 ## Architecture
 
 ```
-LightBurn  <--GRBL/TCP-->  d1ultra_bridge.py  <--Binary/TCP:6000-->  D1 Ultra
+Approach 1 — GRBL (working, limited features):
+  LightBurn  <--GRBL/TCP-->  NOTTESTED_d1ultra_bridge_v2.py  <--Binary/TCP:6000-->  D1 Ultra
+
+Approach 2 — JCZ via RPi Zero (experimental, full galvo):
+  LightBurn  <--JCZ/USB-->  RPi Zero  <--Binary/TCP:6000-->  D1 Ultra
 ```
 
-- LightBurn connects to the bridge as a GRBL 1.1h device (TCP, configurable port)
-- Bridge translates G-code into Hansmaker's binary packet protocol
-- Laser communicates over USB virtual network adapter (laser=192.168.12.1, host=192.168.12.x)
+The D1 Ultra connects via USB but presents as a virtual Ethernet adapter (RNDIS).
+Laser IP: 192.168.12.1, host gets 192.168.12.x via DHCP. Protocol: TCP port 6000.
 
-## Protocol Knowledge (Reverse-Engineered)
+## GRBL vs JCZ — Why Both Exist
 
-### Packet Format
-- 14-byte header: `magic(0x0A0A) + u16 total_len + u16 pad + u16 seq + u16 pad + u16 msg_type + u16 cmd`
-- Variable payload
-- 4-byte tail: `u16 CRC-16/MODBUS + 0x0D0D terminator`
-- CRC is computed over bytes 2 through end of payload (everything after magic, before CRC)
+Using GRBL as the base means you don't get galvo-specific features like live framing, split
+marking, or cylinder correction. A JCZ galvo controller profile is the better starting point
+for full support.
 
-### Known Commands
-| Cmd    | Name          | msg_type | Description |
-|--------|---------------|----------|-------------|
-| 0x0000 | STATUS        | 1        | Heartbeat / status query |
-| 0x0000 | JOB_SETTINGS  | 0        | Per-path job parameters (passes, speed, freq, power, laser_source) |
-| 0x0001 | PATH_DATA     | 0        | Coordinate segments for one path group |
-| 0x0002 | JOB_DATA      | 1        | Job upload header (name + PNG preview) |
-| 0x0003 | JOB_CONTROL   | 1        | Laser signals "paths received, ready to execute" (laser→host only) |
-| 0x0004 | JOB_NAME      | 1        | Job finalize (256-byte name field) |
-| 0x0012 | AUTOFOCUS     | 1        | Autofocus probe request |
-| 0x0013 | QUERY_13      | 1        | Unsolicited laser status |
-| 0x0014 | QUERY_14      | 1        | Unsolicited laser info |
-| 0x0015 | QUERY_15      | 1        | Unsolicited laser info |
-| 0x0018 | DEVICE_INFO   | 1        | Device info query (32-byte payload with device_id) |
+The problem: LightBurn's JCZ driver expects a USB device with BJJCZ VID/PID (0x9588:0x9899).
+The D1 Ultra's USB presents as RNDIS (network adapter), not a BJJCZ controller. So LightBurn's
+JCZ driver won't bind to it. A Raspberry Pi Zero solves this by sitting in the middle — it
+presents as BJJCZ to the PC and talks TCP to the laser.
 
-### M+ Job Execution Sequence (from pcapng captures)
+## Critical Protocol Discovery (April 2026)
+
+### 0x0003 (JOB_CONTROL) — The Execution Trigger
+
+Automated pcapng analysis of all 26 Wireshark captures proved that in every successful M+ job:
+
+1. **HOST sends 0x0003** (empty payload, 18 bytes) to 192.168.12.1:6000
+2. **LASER echoes 0x0003** (2-byte ACK payload) back to host
+
+Verified with full IP/port extraction across 4 independent captures from 3 different host IPs.
+The host initiates execution. See `temp/verify_0x0003_direction.py` for the proof.
+
+**However:** An earlier test of sending 0x0003 from the bridge caused uncontrolled Z-axis
+descent. This was likely because 0x0003 was sent without valid job data uploaded first,
+or at the wrong point in the sequence. The v2 bridge now sends 0x0003 at the correct
+position (after all SETTINGS+PATH pairs). This is being tested.
+
+### Other v2 Fixes (from pcapng analysis)
+
+| Fix | Detail |
+|-----|--------|
+| JOB_SETTINGS unknown field | Changed from 0.0 to -1.0 (M+ always sends -1.0) |
+| WORKSPACE (0x0009) payload | Changed from 40 to 42 bytes (M+ sends 2-byte pad) |
+| PRE_JOB (0x0005) | Added before JOB_UPLOAD (M+ sends this) |
+| QUERY_14(0x02) pre-job | Added before job (M+ sends this) |
+| PNG preview | Changed from 0/286 bytes to ~6 KB (M+ sends 6-14 KB) |
+| Unsolicited ACKs | Now responds to 0x0013/0x0014/0x0015 from laser |
+| G1 S0 duplicate filter | Removes trailing zero-power points from LightBurn |
+| Packet pacing | 10ms between SETTINGS+PATH pairs (matches M+) |
+
+### SETTINGS:PATH Ratio
+
+Not always 1:1. Pcapng shows:
+- SVG with separate objects: 3 SETTINGS, 3 PATHS (1:1 per object)
+- "hello" text: 1 SETTINGS, 4-1799 PATHS (1:many, same settings for all)
+
+M+ sends SETTINGS once per unique parameter set. Sending before every path is safe but wasteful.
+
+## Protocol Summary
+
+Full spec in PROTOCOL.md. Quick reference:
+
+- **Packet:** `0x0A0A + u16 len + u16 pad + u16 seq + u16 pad + u16 msg_type + u16 cmd + payload + u16 CRC-16/MODBUS + 0x0D0D`
+- **CRC:** over bytes 2 through end of payload
+- **Job sequence:** DEVICE_INFO → JOB_UPLOAD (with PNG) → [SETTINGS + PATH] × N → HOST sends 0x0003 → LASER echoes 0x0003 → JOB_FINISH
+- **JOB_SETTINGS:** 37 bytes, msg_type=0. passes(u32) + speed(f64) + freq(f64) + power(f64) + source(u8) + unknown(f64, always -1.0)
+- **PATH_DATA:** msg_type=0. count(u32) + segments[](f64 X + f64 Y + 16 zero bytes each). Coordinates centered on design bbox midpoint.
+- **Heartbeat:** STATUS (0x0000) every ~2s. Laser disconnects after ~10s idle.
+
+## File Structure
+
 ```
-1. HOST → LASER: DEVICE_INFO (0x0018, msg_type=1)
-2. HOST → LASER: JOB_DATA    (0x0002, msg_type=1) — name + PNG preview
-3. For EACH path/shape in the design:
-   a. HOST → LASER: JOB_SETTINGS (0x0000, msg_type=0)
-   b. HOST → LASER: PATH_DATA    (0x0001, msg_type=0)
-4. LASER → HOST: JOB_CONTROL  (0x0003, msg_type=1) — "ready to execute"
-5. HOST → LASER: JOB_NAME     (0x0004, msg_type=1) — finalize
-6. LASER → HOST: STATUS        (0x0000) — job running / complete
+d1ultra_bridge.py            v1 bridge (historical, has the original blocker)
+NOTTESTED_d1ultra_bridge_v2.py         v2 bridge with all protocol fixes (current)
+PROTOCOL.md                  Full binary protocol specification
+CLAUDE.md                    This file (project context for Claude Code)
+README.md                    Public documentation
+LICENSE                      MIT
+requirements.txt             No external deps (stdlib only)
+.gitignore                   Excludes temp/, __pycache__, debug.txt
+wireshark_captures/          26 pcapng files from M+ sessions
+NOTDONE_rpi_zero_bridge/             RPi Zero JCZ bridge (experimental)
+  rpi_jcz_bridge.py          Main bridge: FunctionFS USB gadget + JCZ translation
+  jcz_commands.py            BJJCZ command definitions + parser
+  setup_gadget.sh            Linux USB gadget setup (creates BJJCZ VID/PID device)
+  README.md                  RPi-specific docs
+temp/                        Gitignored test workspace
+  analyze_captures.py        Pcapng analyzer (protocol verification)
+  deep_analysis.py           TCP-reassembled deep analysis
+  verify_0x0003_direction.py Full IP/port proof for 0x0003 direction
 ```
 
-**Critical protocol detail:** The host must send JOB_SETTINGS before EACH PATH_DATA, not just once. M+ sends one SETTINGS+PATH pair per path/shape in the design.
+## RPi Zero JCZ Bridge — Architecture
 
-**Critical protocol detail:** The host must NEVER send 0x0003 to the laser. M+ never does this. Sending it triggers a Z-axis descent sequence.
+### How it works
 
-### PATH_DATA Format
-- Coordinates are centered around the design's bounding-box midpoint (not absolute bed position)
-- Each segment: `f64 X + f64 Y + 16 zero bytes` = 32 bytes
-- Payload: `u32 segment_count + segments[]`
+1. Pi Zero's USB device port presents as BJJCZ controller (configfs gadget)
+2. LightBurn detects it as JCZ and sends 12-byte bulk commands in 3072-byte chunks
+3. Bridge parses JCZ movement/laser commands, translates to D1 Ultra TCP packets
+4. Pi Zero's USB host port connects to D1 Ultra (RNDIS ethernet to 192.168.12.1)
 
-### JOB_SETTINGS Payload (37 bytes)
-```
-u32  passes
-f64  speed_mm_min
-f64  frequency_khz
-f64  power_frac (0.0–1.0)
-u8   laser_source (0=IR, 1=Diode)
-f64  unknown (always 0.0 in captures)
-```
+### JCZ Protocol (from Bryce Schroeder's balor project)
 
-### JOB_DATA Payload
-```
-bytes 0-255:   Job name, null-padded
-bytes 256-257: Padding (0x0000)
-bytes 258-261: PNG size as u32 LE
-bytes 262+:    PNG image data (preview thumbnail)
-```
+- USB endpoints: Bulk OUT 0x02 (commands), Bulk IN 0x88 (status)
+- Command format: 12 bytes — u16 opcode + 5× u16 params (little-endian)
+- Chunking: 256 commands per transfer (3072 bytes), padded with NOP (0x8002)
+- Coordinates: 16-bit unsigned (0x0000-0xFFFF), center=0x8000
+- Key opcodes: TRAVEL(0x8001), MARK(0x8005), SET_POWER(0x8012), JOB_BEGIN(0x8051)
 
-### Other Details
-- device_id for DEVICE_INFO: 0x8B1B (packs as `1b 8b` LE)
-- device_id for autofocus: 0x1A8B (packs as `8b 1a` LE) — different!
-- Laser has ~10 second idle timeout; heartbeat STATUS pings every 2s keep it alive
-- Heartbeat must continue running during job execution
+### What needs work
 
-## What Works
+- FunctionFS endpoint descriptors need real-hardware testing
+- Galvo-to-mm coordinate calibration (field size mapping)
+- JCZ speed/power/frequency value scaling
+- Status response format (currently returns zeros)
+- Real-time performance on Pi Zero 2W under load
 
-- TCP connection to laser over USB virtual NIC
-- Heartbeat / keepalive
-- Firmware version and motor calibration data retrieval
-- GRBL 1.1h emulation (LightBurn connects and sends G-code)
-- G-code parsing into path groups (split at G0 rapid moves)
-- Coordinate centering (GRBL absolute → design-centered)
-- Full job packet sequence: DEVICE_INFO → JOB_DATA → [SETTINGS+PATH]×N → JOB_FINISH
-- Laser ACKs every packet we send
-- Z-axis commands (manual jog)
-- Console interface with interactive commands
+## External Context
 
-## What Does NOT Work — The Blocker
-
-**The laser never sends JOB_CONTROL (0x0003) after receiving our job data.**
-
-Without JOB_CONTROL, the job is uploaded but never executes. The laser ACKs every packet, stays connected, responds to heartbeats, and ACKs JOB_FINISH — but never fires JOB_CONTROL and never engraves.
-
-When M+ sends the same SVG with identical settings, the laser DOES send JOB_CONTROL and the job executes.
-
-### What Has Been Tried
-1. Sending JOB_START (0x0003) host→laser — caused Z-axis descent, removed
-2. Single JOB_SETTINGS + all PATH_DATA — changed to per-path SETTINGS+PATH pairs
-3. Absolute GRBL coordinates — changed to centered coordinates matching M+
-4. No PNG in JOB_DATA — added 286-byte PNG preview
-5. Various timeout/heartbeat adjustments
-
-### Verified Matching M+ (via pcapng comparison)
-- DEVICE_INFO request/response: byte-identical
-- JOB_SETTINGS payload: byte-identical (same passes/speed/freq/power/laser_source)
-- PATH_DATA format: correct (u32 count + f64 X + f64 Y + 16 zero pad per segment)
-- PATH_DATA coordinates: centered, matching M+ values (±9.0mm for the test SVG)
-- JOB_FINISH: same structure, just different job name string
-- CRC-16/MODBUS: computed correctly
-
-### Known Remaining Differences vs M+
-1. **PNG preview size**: Our PNG is 286 bytes; M+'s is ~6255 bytes. Unknown if size matters.
-2. **G1 S0 duplicate point**: LightBurn's G-code emits `G1 S0` before M5, which adds a duplicate closing point to the last path group (6 points vs M+'s 5 for the square). Should be filtered.
-3. **Unsolicited laser messages (0x0013, 0x0014, 0x0015)**: M+ receives these before/during the job. Our bridge also receives them (via reader thread) but doesn't respond. Unknown if a response is needed.
-
-## Recommended Next Steps
-
-### 1. Protocol Replay Tool (Highest Priority)
-Write a tool that sends the **exact raw bytes** from the M+ pcapng capture to the laser (replaying the HOST→LASER packets with correct timing). If the laser responds with JOB_CONTROL, we know the M+ bytes work. Then change one variable at a time (our job name, our PNG, our coordinates, etc.) to find exactly what breaks it.
-
-This eliminates all guesswork — we'd know within minutes which specific byte(s) the laser cares about.
-
-### 2. Capture Current Bridge Traffic
-Run Wireshark during a bridge job and compare the ACTUAL wire bytes against the M+ capture. The bridge logs only show the first 40 bytes of each packet — there could be a bug in the remaining bytes that we can't see in logs.
-
-### 3. Investigate Unsolicited Messages
-The M+ capture shows the laser sends 0x0013 and 0x0015 BEFORE DEVICE_INFO, and 0x0014 AFTER. These might be "handshake" messages that the host needs to acknowledge or that put the laser into a state where it accepts jobs. Check if the bridge receives these and whether responding changes anything.
-
-### 4. Filter Duplicate Points
-Remove the extra point caused by `G1 S0` (duplicate of the last position). While probably not the root cause, it makes the path data diverge from M+.
-
-## Files
-
-- `d1ultra_bridge.py` — The main bridge (single file, ~1600 lines)
-- `test_square.svg` — Simple 20×20mm test SVG (square with X diagonals)
-- `parse_engrave_capture.py` — pcapng parser for protocol analysis
-- `parse_engrave_capture_detailed.py` — Enhanced parser with full hex dumps
-- `CAPTURE_ANALYSIS_SUMMARY.txt` — Analysis of the "hello" engrave capture
-- `capture_comparison.txt` — Side-by-side M+ vs bridge comparison (SVG test)
-- `HEX_PAYLOAD_COMPARISON.txt` — Byte-level hex comparison
-
-### Pcapng Captures (in uploads/)
-- `hello_mark_line_engrave_70power_400speed_processing1.pcapng` — M+ "hello" text engrave
-- `svg_from_m+.pcapng` — M+ test_square.svg engrave (reference)
-- `svg_from_lightburn.pcapng` — Bridge test_square.svg attempt (pre-fix)
-- `autofocus.pcapng` — M+ autofocus sequence
-- `full_capture_connect_reset_motor.pcapng` — M+ connect + motor reset
-
-## Project Goals
-- MIT license, GitHub-ready
-- Marked as unmaintained / community project
-- No warranty
-- Clear notice that Hansmaker should NOT be contacted about this bridge
+- Project posted to the official Hansmaker Facebook group
+- Protocol documentation is freely available for anyone to use
+- balor project (GitLab: bryce15/balor) has the BJJCZ reverse engineering
+- galvoplotter (GitHub: meerk40t/galvoplotter) is a higher-level BJJCZ Python library

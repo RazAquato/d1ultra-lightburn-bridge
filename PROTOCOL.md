@@ -134,15 +134,16 @@ This is how M+ sends a job to the laser.
 3. For EACH path/shape in the design:
    a. HOST->LASER: cmd 0x0000 (msg_type=0)  Set job parameters for this path
    b. HOST->LASER: cmd 0x0001 (msg_type=0)  Send path coordinate segments
-4. LASER->HOST:  cmd 0x0003              Laser signals "paths received, ready"
-5. HOST->LASER:  cmd 0x0004              Finalize job (send job name)
-6. LASER->HOST:  cmd 0x0000              Status updates (running / complete)
+4. HOST->LASER:  cmd 0x0003              Host sends JOB_CONTROL (triggers execution)
+5. LASER->HOST:  cmd 0x0003              Laser echoes JOB_CONTROL (confirms ready)
+6. HOST->LASER:  cmd 0x0004              Finalize job (send job name)
+7. LASER->HOST:  cmd 0x0000              Status updates (running / complete)
 ```
 
 ### Critical protocol rules
 
-- **JOB_SETTINGS before EACH path:** The host must send cmd 0x0000 (msg_type=0) before EACH cmd 0x0001, not just once. M+ sends one SETTINGS+PATH pair per path/shape.
-- **Never send 0x0003 to the laser:** The host must NEVER send cmd 0x0003 to the laser. This causes an uncontrolled Z-axis descent. Only the laser sends 0x0003 to the host.
+- **HOST must send 0x0003 (JOB_CONTROL) to trigger execution.** Pcapng analysis of ALL successful M+ captures confirms the host sends 0x0003 (empty payload) after all path data. The laser echoes 0x0003 back (2-byte ACK payload) to confirm. Without this, the laser accepts all data but never fires. *(Earlier documentation incorrectly stated the host must never send 0x0003. This was wrong — the Z-axis issue was likely caused by sending 0x0003 at the wrong point in the sequence.)*
+- **JOB_SETTINGS before paths:** M+ sends one JOB_SETTINGS before paths with the same parameters. For SVG with multiple objects, it sends SETTINGS before each PATH (1:1). For text with uniform settings, it sends one SETTINGS followed by all PATHs (1:many). Sending SETTINGS before every PATH is safe.
 - **msg_type matters:** JOB_SETTINGS and PATH_DATA use msg_type=0. All other commands use msg_type=1.
 
 ### IR laser job (additional steps)
@@ -229,11 +230,13 @@ Offset  Size   Description
 
 M+ sends a ~6KB rendered preview PNG. The preview may be mandatory.
 
-### CMD 0x0003 — Job Control (LASER->HOST only)
+### CMD 0x0003 — Job Control (bidirectional)
 
-Empty payload. Sent BY the laser after all path data is received and processed. Signals the laser is ready to execute.
+**HOST->LASER:** Empty payload (18 bytes total). Sent by the host after all SETTINGS+PATH pairs to trigger job execution.
 
-**The host must NEVER send this command.** Sending it causes uncontrolled Z-axis descent.
+**LASER->HOST:** 2-byte payload (0x0000 ACK, 20 bytes total). Echoes the same sequence number back to confirm the laser is ready to execute.
+
+This is a standard request/response. The host must send 0x0003 to start the job. Verified across all M+ captures.
 
 ### CMD 0x0004 — Finalize Job
 
