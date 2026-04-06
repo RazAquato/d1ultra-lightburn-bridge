@@ -83,8 +83,9 @@ Full spec in PROTOCOL.md. Quick reference:
 ## File Structure
 
 ```
-d1ultra_bridge.py              Current bridge (v2.3, confirmed working)
-NOTTESTED_d1ultra_bridge_v2.py Obsolete stub (superseded by d1ultra_bridge.py)
+d1ultra_protocol.py            Protocol library — clean API for D1 Ultra communication
+d1ultra_bridge.py              GRBL bridge v2.3 (confirmed working, monolithic)
+NOTTESTED_d1ultra_bridge_v2.4.py  v2.4 bridge — uses protocol library, adds WORKSPACE framing
 PROTOCOL.md                    Full binary protocol specification
 CLAUDE.md                      This file (project context for Claude Code)
 README.md                      Public documentation
@@ -116,6 +117,20 @@ When the bridge sent queries (0x0013/0x0015), the laser's responses were being t
 Fix: check `self._pending` FIRST — if a caller is waiting for that seq, route as normal response.
 Only ACK truly unsolicited messages, and track `_acked_unsolicited` to never ACK the same
 (cmd, seq) pair twice.
+
+### WORKSPACE (0x0009) — Native Preview/Framing (v2.4 discovery)
+
+Analysis of preview_200.pcapng and preview_1000.pcapng revealed that M+ does NOT send a full
+job for preview. Instead, WORKSPACE alone triggers the laser to physically trace the bounding
+box. The sequence is:
+
+  QUERY_13 -> QUERY_15 -> DEVICE_INFO -> QUERY_14(0x02) -> WORKSPACE(speed, bbox)
+  ...laser traces bounding box, STATUS shows busy (state=0x0001)...
+  PRE_JOB (0x0005) -> stops the preview
+
+No JOB_UPLOAD, no PATH_DATA, no JOB_CONTROL needed. The WORKSPACE ACK is asynchronous —
+it arrives after PRE_JOB stops the preview. The speed field in WORKSPACE is the trace speed
+(M+ uses 200 or 1000 mm/min). This is vastly simpler than the zero-power-job approach.
 
 ## RPi Zero JCZ Bridge — Architecture
 

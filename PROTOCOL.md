@@ -259,6 +259,12 @@ Offset  Size  Type    Description
 
 42-byte payload: 5 doubles + 2-byte padding.
 
+**Dual purpose:** During a job sequence, this sets the bounding box. When sent standalone
+(after the preamble QUERY_13 + QUERY_15 + DEVICE_INFO + QUERY_14), **the laser physically
+traces the bounding box rectangle** — this is how M+ implements preview/framing. The laser
+enters busy state (STATUS returns 0x0001). Send PRE_JOB (0x0005) to stop the preview.
+The WORKSPACE ACK is asynchronous — it arrives after the preview finishes or is stopped.
+
 ```
 Offset  Size  Type  Description
 ------  ----  ----  ------------------
