@@ -85,7 +85,7 @@ def crc16_modbus(data: bytes) -> int:
 | `0x0000` | PC->Laser | 0 | Job settings (per-path parameters) |
 | `0x0001` | PC->Laser | 0 | Path data (coordinate segments) |
 | `0x0002` | PC->Laser | 1 | Job upload header (name + PNG preview) |
-| `0x0003` | **Laser->PC** | 1 | Job control — laser signals "ready to execute" |
+| `0x0003` | **Both** | 1 | Job control — host sends to trigger execution, laser echoes to confirm |
 | `0x0004` | PC->Laser | 1 | Finalize job (job name) |
 | `0x0005` | PC->Laser | 1 | Pre-job initialization |
 | `0x0006` | PC->Laser | 1 | Device identification (returns device name) |
@@ -130,14 +130,16 @@ This is how M+ sends a job to the laser.
 
 ```
 1. HOST->LASER:  cmd 0x0018              Query device info
-2. HOST->LASER:  cmd 0x0002              Upload job header (name + PNG preview)
-3. For EACH path/shape in the design:
+2. HOST->LASER:  cmd 0x0005              Pre-job initialization
+3. HOST->LASER:  cmd 0x0014 (sub=0x02)   Pre-job setup
+4. HOST->LASER:  cmd 0x0002              Upload job header (name + ~6KB PNG preview)
+5. HOST->LASER:  cmd 0x0009              Workspace / bounding box (42-byte payload)
+6. For EACH path/shape in the design (10ms pacing between pairs):
    a. HOST->LASER: cmd 0x0000 (msg_type=0)  Set job parameters for this path
    b. HOST->LASER: cmd 0x0001 (msg_type=0)  Send path coordinate segments
-4. HOST->LASER:  cmd 0x0003              Host sends JOB_CONTROL (triggers execution)
-5. LASER->HOST:  cmd 0x0003              Laser echoes JOB_CONTROL (confirms ready)
-6. HOST->LASER:  cmd 0x0004              Finalize job (send job name)
-7. LASER->HOST:  cmd 0x0000              Status updates (running / complete)
+7. HOST->LASER:  cmd 0x0003              Host sends JOB_CONTROL (triggers execution)
+   LASER->HOST:  cmd 0x0003              Laser echoes JOB_CONTROL (confirms ready)
+8. HOST->LASER:  cmd 0x0004              Finalize job (send job name)
 ```
 
 ### Critical protocol rules
@@ -151,14 +153,14 @@ This is how M+ sends a job to the laser.
 Before the job upload, the IR sequence includes autofocus:
 
 ```
-1-2.  Same as diode (DEVICE_INFO + JOB_DATA)
+1-3.  Same as diode (DEVICE_INFO + PRE_JOB + QUERY_14)
 Pre:  cmd 0x000E [02, 00]    Select IR/focus laser (standby)
       cmd 0x0012              Request autofocus measurement (hw_id=0x1A8B)
         <- Laser returns Z-height measurement
       cmd 0x000F              Set Z-height from measurement
       (Repeat 3 times for averaging)
       cmd 0x000E [02, 01]    Activate IR module
-3-6.  Same as diode (but JOB_SETTINGS byte[28]=0 for IR source)
+4-8.  Same as diode (but JOB_SETTINGS byte[28]=0 for IR source)
 Post: cmd 0x000E [02, 01]    Re-activate after job
 ```
 
@@ -255,7 +257,7 @@ Offset  Size  Type    Description
 
 ### CMD 0x0009 — Workspace / Preview Configuration
 
-40-byte payload with 5 doubles:
+42-byte payload: 5 doubles + 2-byte padding.
 
 ```
 Offset  Size  Type  Description
@@ -265,6 +267,7 @@ Offset  Size  Type  Description
 16      8     f64   Bounding box Y min (mm)
 24      8     f64   Bounding box X max (mm)
 32      8     f64   Bounding box Y max (mm)
+40      2     -     Padding (0x0000)
 ```
 
 ### CMD 0x000B — Motor Reset / Calibration
