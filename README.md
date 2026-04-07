@@ -1,5 +1,33 @@
 # D1 Ultra LightBurn Bridge
 
+> **THIS IS A DEVELOPMENT PROJECT — NOT A FINISHED PRODUCT**
+>
+> This repository is an active reverse-engineering effort. It is intended for
+> **developers and tinkerers** who want to understand the D1 Ultra protocol
+> and contribute to building a bridge. **It is not ready for end users.**
+>
+> - The **GRBL bridge** works for basic line engraving only — no fill/raster,
+>   no framing, no job monitoring. v2.4 is untested.
+> - The **JCZ bridge** captures LightBurn commands successfully but has **not yet
+>   been tested with a real laser** — the translation layer is incomplete.
+>
+> If you just want to use your D1 Ultra today, use Hansmaker's M+ software.
+> If you want to help build something better, read on.
+
+> **DO NOT CONTACT HANSMAKER ABOUT THIS PROJECT**
+>
+> Hansmaker did not create this software and has no involvement with it.
+> Please **do not** contact Hansmaker support, forums, or social media with
+> questions or bug reports related to this bridge. They are a small team
+> and have enough to deal with supporting their own products.
+>
+> - Issues with this bridge → [open a GitHub issue here](https://github.com/RazAquato/d1ultra-lightburn-bridge/issues)
+> - Issues with M+ or D1 Ultra hardware → contact Hansmaker through their official channels
+>
+> **This project is not affiliated with, endorsed by, or supported by Hansmaker in any way.**
+
+---
+
 A reverse-engineered bridge that lets [LightBurn](https://lightburnsoftware.com/) control the **Hansmaker D1 Ultra** laser engraver.
 
 The D1 Ultra uses a proprietary binary protocol over TCP — not GRBL. This project provides two approaches to bridge that gap, plus a complete protocol specification for anyone building their own integration.
@@ -96,26 +124,11 @@ The Linux VM handles all the protocol translation. LightBurn on Windows just see
 
 ---
 
-## Important Notices
-
-### Do NOT Contact Hansmaker About This Bridge
-
-**Hansmaker did not create this software and has no involvement with it.** Please do not contact Hansmaker support, forums, or social media with questions or bug reports related to this bridge. They are a small team and have enough to deal with supporting their own products.
-
-- Issues with this bridge -> [open a GitHub issue here](https://github.com/RazAquato/d1ultra-lightburn-bridge/issues)
-- Issues with M+ or D1 Ultra hardware -> contact Hansmaker through their official channels
-
-**This project is not affiliated with, endorsed by, or supported by Hansmaker in any way.**
-
-### Disclaimer
+## Disclaimer
 
 **This software is provided as-is, with absolutely no warranty.** It was reverse-engineered from Wireshark captures of the official M+ software and may be incomplete or incorrect. Use at your own risk. The authors are not responsible for any damage to your laser, materials, property, or anything else. Always wear appropriate laser safety equipment and never leave a running laser unattended.
 
-### Community Project
-
-This project is provided to the community as a starting point. Pull requests are welcome. You are welcome to fork it and build on it.
-
-The protocol documentation here is freely available for anyone to use.
+This project is provided to the community as a starting point. Pull requests are welcome. The protocol documentation is freely available for anyone to use.
 
 ---
 
