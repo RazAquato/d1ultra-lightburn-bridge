@@ -85,6 +85,44 @@ See **[grbl_bridge/README.md](grbl_bridge/README.md)** for setup and details.
 If you just want to engrave some lines today with minimal setup, use the GRBL bridge.
 If you want full galvo features and are comfortable setting up a Linux VM, use the JCZ bridge.
 
+### Why Does the JCZ Bridge Need a Linux Machine?
+
+LightBurn doesn't speak the D1 Ultra's protocol. It *does* speak to BJJCZ galvo
+controllers over USB. The JCZ bridge creates a **fake BJJCZ USB device** that LightBurn
+connects to, then translates those commands to the D1 Ultra's TCP protocol.
+
+```
+ With the bridge (current approach):
+
+ ┌──────────┐   USB/IP    ┌─────────────────────────────┐    USB     ┌──────────┐
+ │ LightBurn├────────────►│ Linux machine                │───────────►│ D1 Ultra │
+ │ (JCZ mode)│  (network)  │                             │  (RNDIS)   │  laser   │
+ └──────────┘             │  fake BJJCZ ──► translator  │            └──────────┘
+                          │  USB device      JCZ → D1   │
+                          └─────────────────────────────┘
+                           Requires modified kernel module
+                           to create USB device with
+                           correct endpoint address (0x88)
+```
+
+The fake USB device requires a **modified Linux kernel module** — it cannot run in
+Docker, WSL2, or any environment where you can't load custom kernel modules.
+
+If the JCZ bridge reaches a stable release, the intended deployment options are:
+
+| Option | Description |
+|--------|-------------|
+| **Dedicated Linux machine** | Any Debian 13+ box with USB passthrough to the D1 Ultra |
+| **Hyper-V or VirtualBox VM** | A pre-configured VM image that users import and run |
+| **Raspberry Pi (4/5)** | Headless bridge on a cheap SBC — real kernel, no VM needed |
+
+For users who don't want to set up a Linux environment, the **GRBL bridge** runs on
+any OS (Windows, Mac, Linux) with no kernel modifications — but is limited to basic
+line engraving.
+
+> **None of this is ready yet.** The JCZ bridge has not been tested with a real laser.
+> These are development goals, not available options.
+
 ---
 
 ## For Integrators (LightBurn, etc.)
