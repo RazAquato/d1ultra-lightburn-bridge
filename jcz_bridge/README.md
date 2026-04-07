@@ -1,4 +1,4 @@
-# VM JCZ Bridge — BJJCZ Galvo Emulator over USB/IP
+# JCZ Bridge — BJJCZ Galvo Emulator over USB/IP
 
 > **STATUS: Working. LightBurn connects, detects device, sends framing and engrave jobs.**
 > Tested 2026-04-07 on Debian 13 (kernel 6.12), LightBurn on Windows 11.
@@ -26,10 +26,9 @@ split marking, cylinder correction, and native galvo speed/power control**. The 
 isn't a galvo laser, but by emulating the BJJCZ USB protocol, we get access to all
 of these features through LightBurn's existing JCZ driver.
 
-The previous approach (`jcz_bridge/` in this repo) used stock `dummy_hcd`, which
-assigned endpoint address 0x81 for the IN endpoint. LightBurn's JCZ driver requires
-**endpoint 0x88** (matching real BJJCZ hardware). This version solves that with a
-modified kernel module.
+An earlier attempt used stock `dummy_hcd`, which assigned endpoint address 0x81 for
+the IN endpoint. LightBurn's JCZ driver requires **endpoint 0x88** (matching real
+BJJCZ hardware). This version solves that with a modified kernel module.
 
 ## The Endpoint 0x88 Problem (and Solution)
 
@@ -154,7 +153,7 @@ to actually drive the laser hardware.
 ## File Structure
 
 ```
-vm_jcz_bridge/
+jcz_bridge/
 ├── README.md                  This file
 ├── TODO.md                    What needs to be done
 ├── config.py                  Configuration (laser IP, field size, etc.)
@@ -196,14 +195,3 @@ sudo depmod -a
 - [balor](https://gitlab.com/bryce15/balor) — BJJCZ reverse engineering (Bryce Schroeder)
 - [galvoplotter](https://github.com/meerk40t/galvoplotter) — BJJCZ Python library
 
-## Differences from `jcz_bridge/`
-
-The `jcz_bridge/` folder in this repo was the first attempt. It used stock `dummy_hcd`
-and got endpoint 0x81 instead of 0x88. This folder (`vm_jcz_bridge/`) is the working
-version with:
-
-1. **Modified `dummy_hcd`** for correct endpoint 0x88
-2. **`start_configfs.sh`** that handles module swapping
-3. **Verified end-to-end** with LightBurn framing and engrave jobs
-
-Use this folder, not `jcz_bridge/`.
