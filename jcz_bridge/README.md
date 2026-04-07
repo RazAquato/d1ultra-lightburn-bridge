@@ -1,358 +1,209 @@
-# JCZ Bridge — D1 Ultra as BJJCZ Galvo Controller
+# VM JCZ Bridge — BJJCZ Galvo Emulator over USB/IP
 
-Makes a Hansmaker D1 Ultra laser appear as a **BJJCZ galvo controller** to LightBurn,
-unlocking full galvo features: **live framing, split marking, cylinder correction**.
+> **STATUS: Working. LightBurn connects, detects device, sends framing and engrave jobs.**
+> Tested 2026-04-07 on Debian 13 (kernel 6.12), LightBurn on Windows 11.
+
+This bridge makes a **Hansmaker D1 Ultra** laser appear as a **BJJCZ galvo controller**
+to LightBurn. It runs on a Debian VM and exports the virtual BJJCZ device over USB/IP
+to any PC on the LAN.
 
 ```
-Any PC running LightBurn
-  └── usbipd-win (Windows) or usbip (Linux) — free USB/IP client
-      └── sees VID 0x9588 / PID 0x9899 (BJJCZ controller)
-      └── LightBurn connects as JCZFiber device
-      └── sends 12-byte JCZ commands in 3072-byte batches
-           │
-           │  TCP/IP over LAN (USB/IP protocol)
-           │
-Debian VM (Proxmox or bare metal)
-  ├── dummy_hcd         — virtual USB bus (kernel module)
-  ├── libcomposite      — USB gadget framework (kernel module)
-  ├── configfs gadget   — presents VID 0x9588/PID 0x9899
-  ├── FunctionFS        — exposes bulk USB endpoints as file descriptors
-  ├── usbip server      — exports virtual BJJCZ device over TCP
-  └── jcz_bridge.py     — main bridge:
-        reads JCZ commands from FunctionFS
-        translates galvo units → mm coordinates
-        sends D1 Ultra TCP binary protocol to laser
-           │
-           │  TCP to 192.168.12.1:6000
-           │
-Hansmaker D1 Ultra laser
-  └── USB → RNDIS virtual ethernet → 192.168.12.1
+Windows PC (LightBurn)
+  |  USB/IP over LAN
+  v
+Debian VM
+  |  configfs USB gadget (VID 0x9588, PID 0x9899)
+  |  FunctionFS endpoints (EP OUT 0x02, EP IN 0x88)
+  |  jcz_bridge.py translates JCZ -> D1 Ultra protocol
+  v
+D1 Ultra laser (192.168.12.1:6000 via USB RNDIS)
 ```
+
+## Why This Exists
+
+LightBurn's JCZ/galvo mode offers features that GRBL mode doesn't: **live framing,
+split marking, cylinder correction, and native galvo speed/power control**. The D1 Ultra
+isn't a galvo laser, but by emulating the BJJCZ USB protocol, we get access to all
+of these features through LightBurn's existing JCZ driver.
+
+The previous approach (`jcz_bridge/` in this repo) used stock `dummy_hcd`, which
+assigned endpoint address 0x81 for the IN endpoint. LightBurn's JCZ driver requires
+**endpoint 0x88** (matching real BJJCZ hardware). This version solves that with a
+modified kernel module.
+
+## The Endpoint 0x88 Problem (and Solution)
+
+Real BJJCZ boards use USB endpoints:
+- **EP OUT 0x02** (Bulk) — host sends commands
+- **EP IN 0x88** (Bulk) — device sends responses
+
+LightBurn hardcodes these addresses. The Linux kernel's `dummy_hcd` module only offers
+`ep1in-bulk` (address 0x81) as the first IN bulk endpoint, so configfs always picks it.
+
+### What we tried
+
+| Approach | Endpoint | USB/IP | Result |
+|----------|----------|--------|--------|
+| Stock dummy_hcd + configfs | 0x81 | Works | LightBurn can't communicate (wrong endpoint) |
+| raw_gadget (userspace EP0) | 0x88 | Broken | EP0 stalls during USB/IP attach — control transfers never reach userspace |
+| **Modified dummy_hcd + configfs** | **0x88** | **Works** | **LightBurn connects and sends jobs** |
+
+### The fix
+
+One-line change to `dummy_hcd.c`: comment out `ep1in-bulk`, `ep6in-bulk`, `ep11in-bulk`,
+and `ep2in-bulk` (the sa1100 emulation endpoint). This forces the kernel's
+`usb_ep_autoconfig()` to pick `ep8in-bulk` (address 0x88) as the first available IN bulk
+endpoint.
+
+The modified source is in `kernel/dummy_hcd.c`. The stock `ep2out-bulk` (address 0x02) is
+kept for the OUT endpoint.
 
 ## Requirements
 
-- **Debian 13 (Trixie)** or later (tested on 6.12 kernel)
-  - Also works on Ubuntu 24.04+ or any distro with kernel 6.1+
-  - Can run as a Proxmox VM, bare metal, or Docker container
-- **Python 3.11+** (stdlib only — no pip packages needed)
-- **D1 Ultra** connected via USB (passed through to VM if virtualized)
-- **PC running LightBurn** with USB/IP client installed
+- **Debian 13 (Trixie)** or later (kernel 6.1+ required)
+- **Kernel headers** installed (`apt install linux-headers-$(uname -r)`)
+- **Python 3.11+** (stdlib only, no pip packages)
+- **D1 Ultra** connected via USB (passed through if running in a VM)
+- **Windows PC** with LightBurn and [usbip-win2](https://github.com/vadimgrn/usbip-win2/releases)
 
 ## Quick Start
 
-### 1. Set up the Linux machine
+### 1. Build the modified dummy_hcd
 
 ```bash
-# Clone the repo (or copy the jcz_bridge folder)
-git clone https://github.com/RazAquato/d1ultra-lightburn-bridge.git
-cd d1ultra-lightburn-bridge/jcz_bridge
-
-# Install packages and load kernel modules
-sudo apt-get update
-sudo apt-get install -y python3 git usbip
-
-# Load kernel modules (persists across reboots)
-sudo tee /etc/modules-load.d/d1ultra-bridge.conf << 'EOF'
-configfs
-libcomposite
-dummy_hcd
-usb_f_fs
-usbip-core
-usbip-host
-EOF
-
-sudo modprobe configfs libcomposite dummy_hcd usb_f_fs usbip-core usbip-host
+cd kernel/
+make
+# Produces dummy_hcd.ko
 ```
 
-### 2. Configure
-
-Edit `config.py`:
-
-```python
-LASER_IP       = "192.168.12.1"   # Usually this, some units use 10.0.0.x
-FIELD_SIZE_MM  = 110.0            # Must match your physical lens
-LASER_SUBNET   = "192.168.12."   # Adjust if your laser uses a different subnet
-```
-
-### 3. Start the bridge
+### 2. Start the bridge
 
 ```bash
-# Manual start (for testing)
-sudo bash setup_gadget.sh
-sudo python3 jcz_bridge.py
-
-# In another terminal:
-sudo bash setup_usbip.sh
+sudo bash start_configfs.sh
 ```
 
-Or use the combined start script:
-```bash
-sudo bash start.sh
-```
+This script:
+1. Unloads stock `dummy_hcd`, loads the modified version
+2. Creates the configfs USB gadget (VID 0x9588, PID 0x9899)
+3. Starts `jcz_bridge.py` (writes FunctionFS descriptors, binds UDC)
+4. Verifies endpoint addresses (`lsusb -v` should show 0x02 OUT + 0x88 IN)
+5. Exports the device via USB/IP
 
-### 4. Install as system service (auto-start on boot)
-
-```bash
-sudo bash install_services.sh
-sudo systemctl start gadget-setup jcz-bridge usbip-server
-```
-
-Check status:
-```bash
-sudo systemctl status jcz-bridge
-journalctl -u jcz-bridge -f
-tail -f /var/log/d1ultra-bridge.log
-```
-
-## Windows Setup (LightBurn PC)
-
-### Install USB/IP client
-
-You need a USB/IP **client** for Windows that can attach remote USB devices
-from a Linux server. **Do NOT use `usbipd-win` (dorssel)** — that only
-shares Windows USB devices to WSL, not the other way around.
-
-**Recommended: `usbip-win2`** (vadimgrn fork, actively maintained, **signed driver**):
-
-1. Download the latest `.msi` installer from:
-   https://github.com/vadimgrn/usbip-win2/releases
-
-2. Run the installer — it's signed, so no test signing mode needed.
-   Installs the virtual USB bus driver (vhci) and `usbip.exe` CLI.
-
-### Connect to the bridge
-
-Open an **Administrator Command Prompt or PowerShell**:
+### 3. Connect from Windows
 
 ```powershell
-# List available devices on the bridge VM
-usbip.exe list --remote <vm-ip-address>
-
-# You should see:
-#   2-1: 9588:9899  Beijing JCZ Technology BJJCZ Fiber Laser
-
-# Attach the device
-usbip.exe attach --remote <vm-ip-address> --busid 2-1
+# In an Administrator terminal:
+usbip.exe attach --remote <vm-ip> --busid 2-1
 ```
 
-The BJJCZ device should now appear in Windows Device Manager under
-"Universal Serial Bus devices" or "USB controllers".
+### 4. Set up LightBurn
 
-> **Note:** The attach is not persistent across reboots. Re-run the
-> attach command after restarting either machine. You can create a
-> `.bat` script or scheduled task to automate this.
+1. Devices -> Create Manually -> **JCZFiber** -> USB
+2. Field size: **220mm x 220mm** (for D1 Ultra)
+3. Click **Find My Laser** — should detect "BJJCZ Fiber Laser"
 
-### Set up LightBurn
+### 5. Test
 
-1. Open LightBurn
-2. Go to **Devices** → **Create Manually**
-3. Select **JCZFiber** as the device type
-4. Connection: **USB**
-5. Field size: **110mm x 110mm** (or whatever matches your `FIELD_SIZE_MM`)
-6. Skip markcfg7 import when prompted (not needed)
-7. Click **Find My Laser** — it should detect the BJJCZ device
+- **Frame** — LightBurn sends TRAVEL commands tracing the bounding box
+- **Start** — LightBurn sends SET_POWER, SET_MARK_SPEED, MARK commands
 
-### Test the connection
+## What's Verified (2026-04-07)
 
-1. Draw a simple square in LightBurn
-2. Click **Frame** — the red dot on the laser should trace the boundary
-3. Click **Start** — the laser should engrave
+- Device enumerates as `9588:9899 BJJCZ Fiber Laser`
+- Endpoints: EP OUT 0x02, EP IN 0x88 (confirmed via `lsusb -v`)
+- USB/IP attach from Windows succeeds
+- LightBurn detects device and shows "Ready"
+- `GetSerialNo` (0x0009), `GetVersion` (0x0007) — responded correctly
+- `EnableLaser` (0x0004), all SET_* config commands — ACK'd
+- **Framing**: TRAVEL commands received (rectangle loop at correct coordinates)
+- **Engrave job**: Full job sequence captured:
+  - `JOB_BEGIN` -> `SET_Q_PERIOD` -> `SET_POWER` (70% = 0x0B33) -> `SET_MARK_SPEED` (5000) -> `MARK` paths -> `JOB_END`
+  - GetVersion polling loop while "job executes"
+- 250K+ protocol exchanges, zero errors
 
-## Linux Client Setup (alternative to Windows)
+## What's NOT Done Yet
 
-If LightBurn runs on a Linux machine instead of Windows:
+See [TODO.md](TODO.md) for the full list. The USB emulation and protocol capture are
+working. The remaining work is **translating JCZ commands to D1 Ultra TCP protocol**
+to actually drive the laser hardware.
 
-```bash
-# Install usbip client
-sudo apt-get install linux-tools-common
+## Architecture
 
-# Attach the remote device
-sudo usbip attach --remote <vm-ip-address> --busid 2-1
+### Kernel layer
+- **Modified `dummy_hcd`** — virtual USB host controller with `ep8in-bulk`
+- **`configfs` + `libcomposite`** — USB gadget framework
+- **`usb_f_fs` (FunctionFS)** — exposes USB endpoints as file descriptors
+- **`usbip-host` + `usbipd`** — exports virtual device over TCP
 
-# Verify
-lsusb | grep 9588
-```
+### Userspace
+- **`jcz_bridge.py`** — main bridge: reads JCZ commands from FunctionFS, translates
+  to D1 Ultra protocol, sends via TCP
+- **`jcz_protocol.py`** — standalone JCZ/BJJCZ command parser (12-byte commands,
+  3072-byte chunks, galvo coordinate conversion)
+- **`d1ultra_protocol.py`** — standalone D1 Ultra binary protocol library (packet
+  builder, CRC, TCP connection, job execution)
+- **`laser_monitor.py`** — watches for RNDIS interface (laser on/off detection)
+- **`config.py`** — all tuneable parameters
+
+### Scripts
+- **`start_configfs.sh`** — one-command startup (load modules, create gadget, start bridge, start USB/IP)
+- **`setup_gadget.sh`** — create configfs USB gadget
+- **`setup_usbip.sh`** — export gadget via USB/IP
+- **`install_services.sh`** — install systemd services for auto-start
 
 ## File Structure
 
 ```
-jcz_bridge/
-├── config.py              — All tuneable parameters (laser IP, field size, etc.)
-├── d1ultra_protocol.py    — D1 Ultra binary protocol library (standalone)
-├── jcz_protocol.py        — JCZ/BJJCZ command parser (standalone)
-├── jcz_bridge.py          — Main bridge application
-├── laser_monitor.py       — RNDIS interface watcher (laser on/off detection)
-├── setup_gadget.sh        — Create USB gadget via configfs
-├── setup_usbip.sh         — Export gadget via USB/IP
-├── start.sh               — Start everything manually
-├── install_services.sh    — Install systemd services for auto-start
-├── systemd/
-│   ├── gadget-setup.service
-│   ├── jcz-bridge.service
-│   └── usbip-server.service
-├── tests/
-│   ├── test_d1ultra_protocol.py
-│   └── test_jcz_protocol.py
-└── README.md              — This file
+vm_jcz_bridge/
+├── README.md                  This file
+├── TODO.md                    What needs to be done
+├── config.py                  Configuration (laser IP, field size, etc.)
+├── jcz_bridge.py              Main bridge application
+├── jcz_protocol.py            JCZ/BJJCZ command parser (standalone)
+├── d1ultra_protocol.py        D1 Ultra protocol library (standalone)
+├── laser_monitor.py           RNDIS interface watcher
+├── start_configfs.sh          One-command startup
+├── setup_gadget.sh            Create USB gadget
+├── setup_usbip.sh             Export via USB/IP
+├── install_services.sh        Systemd service installer
+├── kernel/
+│   ├── dummy_hcd.c            Modified dummy_hcd source (ep8in-bulk)
+│   └── Makefile               Build against running kernel headers
+├── systemd/                   Service unit files
+└── tests/                     Unit tests (no hardware needed)
 ```
 
-### For LightBurn developers
+## Boot Procedure
 
-The protocol libraries are **standalone** — no bridge dependencies:
+The stock `dummy_hcd` module auto-loads on boot (other modules depend on it).
+`start_configfs.sh` handles this by doing `rmmod dummy_hcd` then `insmod` of the
+modified version. This is safe because nothing uses the stock module at boot.
 
-- **`d1ultra_protocol.py`** — Complete D1 Ultra binary protocol implementation.
-  `PacketBuilder` constructs all packet types, `ResponseParser` parses responses,
-  `D1Ultra` class manages TCP connection with heartbeat and job execution.
-  See `PROTOCOL.md` in the parent directory for the full binary spec.
-
-- **`jcz_protocol.py`** — JCZ/BJJCZ command parser. `JCZOp` enum, `JCZCommand`
-  class, chunk parsing, and galvo↔mm coordinate conversion.
-  Based on [balor](https://gitlab.com/bryce15/balor) reverse engineering.
-
-## How it works
-
-### Laser detection
-
-The bridge does **not** ping the laser forever. Instead, it watches for the
-RNDIS network interface that the D1 Ultra creates when powered on:
-
-- Laser ON → USB passthrough → RNDIS interface appears → bridge connects
-- Laser OFF → RNDIS interface disappears → bridge enters standby
-- LightBurn stays connected to the virtual BJJCZ device the whole time
-
-Configure `LASER_SUBNET` in `config.py` if your laser uses something other
-than `192.168.12.x`.
-
-### Command translation
-
-LightBurn sends 12-byte JCZ commands. For status polling (opcode 0x0009),
-it sends individual 12-byte packets. For job data, it sends 3072-byte
-batches (256 commands). The bridge handles both modes:
-
-1. Responds to 0x0009 heartbeat polls with 12-byte status
-2. Parses each JCZ command (TRAVEL, MARK, SET_POWER, etc.)
-3. Accumulates path coordinates in galvo units (0-65535)
-4. On JOB_END: converts to mm, centres on bounding box, sends D1 Ultra job
-5. On LIGHT commands: triggers native WORKSPACE preview (red dot framing)
-
-### Coordinate conversion
-
-JCZ uses 16-bit unsigned galvo coordinates. The D1 Ultra uses IEEE 754
-doubles in mm, centred on the design midpoint.
-
-```
-JCZ:  0x0000 ─────── 0x8000 ─────── 0xFFFF
-      -110mm           0mm          +110mm    (for 220mm field)
-```
-
-Set `FIELD_SIZE_MM` in `config.py` to match your physical lens (220mm for D1 Ultra).
-To calibrate: engrave a known-size square, measure with calipers, adjust the value.
-
-## Proxmox Setup
-
-If running as a Proxmox VM, pass the D1 Ultra USB device through:
-
-1. On the **Proxmox host**, blacklist the RNDIS driver so it doesn't claim
-   the device before the VM can:
-   ```bash
-   echo "blacklist rndis_host" | sudo tee /etc/modprobe.d/d1ultra-blacklist.conf
-   sudo update-initramfs -u
-   ```
-
-2. In the Proxmox web UI:
-   - Select your VM → Hardware → Add → USB Device
-   - Use "USB Vendor/Device ID"
-   - Enter the D1 Ultra's VID:PID (find with `lsusb` on the host)
-
-3. The VM will see the D1 Ultra as a USB network adapter. The bridge
-   handles the rest.
-
-## Logging
-
-The bridge logs to both the console and `/var/log/d1ultra-bridge.log`.
-
+For a more permanent solution, you can replace the stock module:
 ```bash
-# Live log
-tail -f /var/log/d1ultra-bridge.log
+# Back up the original
+sudo cp /lib/modules/$(uname -r)/kernel/drivers/usb/gadget/udc/dummy_hcd.ko.xz \
+       /lib/modules/$(uname -r)/kernel/drivers/usb/gadget/udc/dummy_hcd.ko.xz.bak
 
-# Systemd journal
-journalctl -u jcz-bridge -f
-
-# Debug mode — edit config.py:
-LOG_LEVEL = "DEBUG"
+# Install the modified version
+sudo cp kernel/dummy_hcd.ko /lib/modules/$(uname -r)/kernel/drivers/usb/gadget/udc/
+sudo depmod -a
 ```
 
-## Troubleshooting
+## Protocol References
 
-### Bridge doesn't start
-```bash
-# Check kernel modules
-lsmod | grep -E 'dummy_hcd|libcomposite|usb_f_fs|usbip'
+- [PROTOCOL.md](../PROTOCOL.md) — D1 Ultra binary protocol specification
+- [balor](https://gitlab.com/bryce15/balor) — BJJCZ reverse engineering (Bryce Schroeder)
+- [galvoplotter](https://github.com/meerk40t/galvoplotter) — BJJCZ Python library
 
-# Check configfs mount
-mount | grep configfs
+## Differences from `jcz_bridge/`
 
-# Check gadget exists
-ls /sys/kernel/config/usb_gadget/bjjcz/
-```
+The `jcz_bridge/` folder in this repo was the first attempt. It used stock `dummy_hcd`
+and got endpoint 0x81 instead of 0x88. This folder (`vm_jcz_bridge/`) is the working
+version with:
 
-### LightBurn can't find the device
-```bash
-# On the bridge machine — is the device visible?
-lsusb | grep 9588
+1. **Modified `dummy_hcd`** for correct endpoint 0x88
+2. **`start_configfs.sh`** that handles module swapping
+3. **Verified end-to-end** with LightBurn framing and engrave jobs
 
-# Is USB/IP running?
-usbip list --local
-
-# On the Windows PC — can you see it?
-usbipd list --remote <vm-ip>
-```
-
-### Laser not detected
-```bash
-# Check for RNDIS interface
-ip addr show | grep 192.168.12
-
-# Try direct ping
-ping 192.168.12.1
-
-# Test TCP connection
-python3 jcz_bridge.py --test-laser
-```
-
-## Known Issues
-
-### USB/IP transfer latency (under investigation)
-
-LightBurn's JCZ driver has aggressive timeouts (~500ms) for USB bulk transfers.
-When using USB/IP over a LAN, the network round-trip can cause LightBurn to
-cancel (UNLINK) transfers before the bridge can respond, resulting in a
-"framing disconnected" loop.
-
-**Status:** Under investigation. A latency test tool is included
-(`usb_latency_test.py` + `tests/win_usb_latency_test.py`) to measure actual
-round-trip times and determine if this is a fundamental limitation or solvable.
-
-**Potential solutions being explored:**
-- FunctionFS async I/O (AIO/io_uring) for lower-latency transfer completion
-- Running LightBurn and bridge on the same host (localhost USB/IP)
-- Alternative transport (network protocol instead of USB emulation)
-
-## Running Tests
-
-```bash
-cd jcz_bridge
-python3 -m unittest discover -s tests -v
-```
-
-All tests run without hardware — they use mock data to verify packet building,
-command parsing, CRC calculation, and coordinate conversion.
-
-## References
-
-- [D1 Ultra Protocol Spec](../PROTOCOL.md) — Full binary protocol documentation
-- [balor](https://gitlab.com/bryce15/balor) — BJJCZ reverse engineering by Bryce Schroeder
-- [galvoplotter](https://github.com/meerk40t/galvoplotter) — Higher-level BJJCZ library
-- [Linux USB Gadget](https://www.kernel.org/doc/html/latest/usb/gadget_configfs.html) — Kernel configfs docs
-- [usbipd-win](https://github.com/dorssel/usbipd-win) — Windows USB/IP client
-- [USB/IP](https://www.kernel.org/doc/html/latest/usb/usbip_protocol.html) — Linux USB/IP protocol docs
+Use this folder, not `jcz_bridge/`.

@@ -1,15 +1,61 @@
 # D1 Ultra LightBurn Bridge
 
-> **STATUS: Working — line engraving confirmed on real hardware (v2.3).**
-> v2.4 (in testing) adds pre-job framing and a standalone protocol library.
+A reverse-engineered bridge that lets [LightBurn](https://lightburnsoftware.com/) control the **Hansmaker D1 Ultra** laser engraver.
 
-A translation bridge that lets [LightBurn](https://lightburnsoftware.com/) control the **Hansmaker D1 Ultra** laser engraver.
+The D1 Ultra uses a proprietary binary protocol over TCP — not GRBL. This project provides two approaches to bridge that gap, plus a complete protocol specification for anyone building their own integration.
 
-The D1 Ultra uses a proprietary binary protocol over TCP — not GRBL. This bridge translates between the two:
+---
+
+## Two Approaches
+
+### JCZ Bridge (active development)
+
+Emulates a **BJJCZ galvo controller** over USB/IP. LightBurn sees the D1 Ultra as a native JCZ galvo device, unlocking full galvo features: **live framing, split marking, cylinder correction, native speed/power control**.
 
 ```
-LightBurn  --GRBL/TCP-->  Bridge (localhost:9023)  --D1 Ultra/TCP-->  Laser (192.168.12.1:6000)
+Windows PC (LightBurn)
+  |  USB/IP over LAN
+  v
+Linux VM (Debian 13+)
+  |  Virtual USB device (VID 0x9588, PID 0x9899, EP IN 0x88)
+  |  configfs + FunctionFS + modified dummy_hcd
+  |  jcz_bridge.py translates JCZ commands
+  v
+D1 Ultra laser (192.168.12.1:6000 via USB RNDIS)
 ```
+
+**Status:** LightBurn connects, detects the device, sends framing and engrave jobs successfully. Waiting for USB cable to test actual laser engraving.
+
+**Requirements:** Linux machine (VM or bare metal) + USB/IP client on the LightBurn PC.
+
+See **[jcz_bridge/README.md](jcz_bridge/README.md)** for setup and details.
+
+### GRBL Bridge (stable, no longer actively developed)
+
+Translates LightBurn's GRBL G-code to D1 Ultra protocol. Simpler setup (runs on same machine as LightBurn), but limited to basic line engraving — no live framing, no fill/raster, no galvo features.
+
+```
+LightBurn  --GRBL/TCP-->  Bridge (localhost:9023)  --D1 Ultra/TCP-->  Laser
+```
+
+**Status:** Working (v2.3) — line engraving confirmed on real hardware.
+
+See **[grbl_bridge/README.md](grbl_bridge/README.md)** for setup and details.
+
+### Which One Should I Use?
+
+| | GRBL Bridge | JCZ Bridge |
+|---|---|---|
+| **Setup complexity** | Simple — runs on any OS | Requires a Linux VM + USB/IP |
+| **LightBurn mode** | GRBL (Ethernet/TCP) | JCZFiber (USB) |
+| **Line engraving** | Yes | Yes (in testing) |
+| **Fill/raster** | No | Planned |
+| **Live framing** | No | Yes |
+| **Split marking** | No | Yes |
+| **Development** | Stable, not active | Active |
+
+If you just want to engrave some lines today with minimal setup, use the GRBL bridge.
+If you want full galvo features and are comfortable setting up a Linux VM, use the JCZ bridge.
 
 ---
 
@@ -24,12 +70,29 @@ If you're implementing native D1 Ultra support, these are the two files you need
 
 The `wireshark_captures/` directory contains all 26 pcapng files from M+ sessions for verification. Filter by `tcp.port == 6000` in Wireshark.
 
-Key things the protocol documentation covers:
-- **Connection**: USB presents as RNDIS virtual Ethernet (192.168.12.1:6000), not serial
-- **Job execution**: 8-step sequence including the critical JOB_CONTROL (0x0003) trigger
-- **Preview/framing**: WORKSPACE (0x0009) alone triggers native bounding box trace
-- **Coordinates**: Centered on design bounding-box midpoint, not absolute bed position
-- **Peripherals**: Fill light, buzzer, focus laser, safety gate, Z-axis, autofocus
+---
+
+## About the JCZ Bridge: USB/IP and the Linux VM
+
+The JCZ bridge requires a Linux machine between LightBurn and the laser. Here's why:
+
+**The problem:** LightBurn's JCZ driver talks to BJJCZ controllers over USB. The D1 Ultra doesn't have a BJJCZ controller — it's a different kind of laser entirely. We need to create a virtual USB device that looks exactly like a BJJCZ board.
+
+**The solution:** Linux's USB gadget framework can create virtual USB devices. We use `configfs` + `FunctionFS` to create a device with the correct VID/PID (0x9588:0x9899) and endpoint addresses (OUT 0x02, IN 0x88). This device is then exported over the network using USB/IP, so any PC on the LAN can attach it as if it were a local USB device.
+
+**What you need:**
+- A Linux machine (a Proxmox VM works great — that's what we use)
+- [usbip-win2](https://github.com/vadimgrn/usbip-win2/releases) installed on the Windows PC (signed driver, simple installer)
+- The D1 Ultra's USB cable passed through to the Linux VM
+
+**Network setup:**
+```
+Windows PC ──── LAN ──── Linux VM ──── USB ──── D1 Ultra
+     |                       |
+     └── USB/IP (TCP 3240) ──┘
+```
+
+The Linux VM handles all the protocol translation. LightBurn on Windows just sees a normal USB laser controller.
 
 ---
 
@@ -56,187 +119,55 @@ The protocol documentation here is freely available for anyone to use.
 
 ---
 
-## Requirements
-
-- Python 3.8+
-- No external packages (stdlib only)
-- Hansmaker D1 Ultra connected via USB
-- LightBurn (any version with GRBL support)
-
-## Quick Start
-
-### 1. Connect the laser
-
-Plug in the D1 Ultra via USB. It creates a virtual network adapter.
-
-```
-ping 192.168.12.1
-```
-
-If the adapter doesn't get an IP, unplug and replug the USB cable.
-
-### 2. Start the bridge
-
-```
-python d1ultra_bridge.py --listen-port 9023
-```
-
-### 3. Set up LightBurn
-
-1. Open LightBurn
-2. Devices -> Create Manually
-3. Select **GRBL** (1.1f or higher)
-4. Connection: **Ethernet/TCP**
-5. Address: **127.0.0.1**, Port: **9023**
-6. Origin: **Front Left**
-7. Disable "Auto home your laser on startup"
-
-### 4. Engrave
-
-Design your job in LightBurn, set power/speed in the Cuts/Layers panel, and hit Start. The bridge translates the G-code into D1 Ultra protocol commands automatically.
-
----
-
-## What Works
-
-- Line engraving (SVG shapes, text, any vector content)
-- Multiple layers (each layer is serialized as a separate job)
-- Power and speed control from LightBurn's layer settings
-- Auto-reconnect after laser idle timeout
-- Z-axis jog commands
-- Interactive console for manual laser control (lights, buzzer, focus, gate, Z-axis)
-- Replay mode for diagnostics (send raw M+ pcapng bytes to laser)
-
-## Known Limitations
-
-- **Fill/raster engraving**: Not yet implemented — only line/outline mode works
-- **Autofocus**: Partially decoded, may not work reliably
-- **Job monitoring**: No real-time progress feedback from the laser during engraving
-
-## In Testing (v2.4)
-
-- **Pre-job framing**: Focus laser traces the bounding box before engraving using native WORKSPACE command (matches M+ behavior). User confirms at console before laser fires.
-- **Protocol library**: `d1ultra_protocol.py` extracted as standalone module for use by any integration.
-
----
-
 ## Project Structure
 
 ```
-d1ultra_protocol.py              Protocol library — standalone D1 Ultra API
-d1ultra_bridge.py                GRBL bridge (v2.3, confirmed working)
-NOTTESTED_d1ultra_bridge_v2.4.py GRBL bridge (v2.4, adds framing — in testing)
-PROTOCOL.md                      Full binary protocol specification
-wireshark_captures/              26 pcapng files from M+ sessions
-NOTDONE_rpi_zero_bridge/         RPi Zero JCZ bridge (experimental)
+README.md                    This file
+PROTOCOL.md                  D1 Ultra binary protocol specification
+d1ultra_protocol.py          Protocol library (standalone, used by both bridges)
+LICENSE                      MIT
+
+jcz_bridge/                  JCZ/BJJCZ galvo emulator (active development)
+  README.md                  Full setup guide
+  TODO.md                    What works, what's next
+  jcz_bridge.py              Main bridge application
+  jcz_protocol.py            JCZ command parser (standalone)
+  d1ultra_protocol.py        Protocol library (copy, for standalone deployment)
+  config.py                  Configuration
+  kernel/                    Modified dummy_hcd source (for endpoint 0x88)
+  start_configfs.sh          One-command startup
+  setup_gadget.sh            USB gadget setup
+  setup_usbip.sh             USB/IP export
+  systemd/                   Service files for auto-start
+
+grbl_bridge/                 GRBL bridge (stable, not actively developed)
+  README.md                  Setup guide
+  d1ultra_bridge.py          v2.3 (confirmed working)
+  NOTTESTED_d1ultra_bridge_v2.4.py  v2.4 (adds framing, untested)
+
+wireshark_captures/          26 pcapng files from M+ sessions
 ```
 
 ---
 
-## How It Works
+## How the D1 Ultra Protocol Works
 
-The D1 Ultra expects this job sequence over TCP port 6000:
+The D1 Ultra connects via USB but presents as a **virtual Ethernet adapter** (RNDIS), not a serial port. It listens on TCP port 6000 at IP 192.168.12.1.
+
+Job execution sequence:
 
 1. **DEVICE_INFO** (0x0018) — query device
 2. **PRE_JOB** (0x0005) — signal upcoming job
 3. **QUERY_14** (0x0014, sub=0x02) — pre-job setup
 4. **JOB_UPLOAD** (0x0002) — job name + PNG preview thumbnail
-5. **WORKSPACE** (0x0009) — bounding box of the design (42 bytes)
-6. For each path/shape (10ms pacing):
-   - **JOB_SETTINGS** (0x0000, msg_type=0) — power, speed, passes, frequency
-   - **PATH_DATA** (0x0001, msg_type=0) — coordinates centered on design midpoint
-7. **JOB_CONTROL** (0x0003) — host tells laser to execute (laser echoes back)
+5. **WORKSPACE** (0x0009) — bounding box of the design
+6. **JOB_SETTINGS** (0x0000) + **PATH_DATA** (0x0001) — power/speed/coordinates per path
+7. **JOB_CONTROL** (0x0003) — host tells laser to execute
 8. **JOB_FINISH** (0x0004) — finalize
 
-### Preview / Framing
-
-WORKSPACE (0x0009) has a dual purpose. When sent standalone (with the preamble queries but without job upload/path data), the laser physically traces the bounding box rectangle. This is how M+ implements its preview feature. Send PRE_JOB (0x0005) to stop the preview.
-
-### Key Discovery
-
-The critical blocker in v1 was that the **host must send JOB_CONTROL (0x0003)** to initiate execution. Earlier documentation incorrectly stated the laser sends this. Pcapng analysis of every successful M+ capture proved the host always initiates.
+See **[PROTOCOL.md](PROTOCOL.md)** for the complete specification.
 
 ---
-
-## Interactive Console
-
-The bridge provides an interactive `d1ultra>` prompt alongside the LightBurn connection.
-
-| Command | Description |
-|---------|-------------|
-| `light on/off` | Fill light |
-| `buzzer on/off` | Buzzer |
-| `focus on/off` | Focus laser pointer |
-| `gate on/off` | Safety gate |
-| `home` | Home/reset all motors |
-| `up/down <mm>` | Move Z-axis (default 5mm) |
-| `autofocus` | IR autofocus (3-probe average) |
-| `ping` | Check laser connection |
-| `status` / `info` | Show bridge/device state |
-| `help` / `quit` | Help or shut down |
-
-LightBurn console commands also work: `$FOCUS`, `$FOCUS OFF`, `$AUTOFOCUS`/`$AF`, `$H`
-
-## Command-Line Options
-
-```
-python d1ultra_bridge.py [options]
-
-  --laser-ip IP       D1 Ultra IP (default: 192.168.12.1)
-  --laser-port PORT   D1 Ultra TCP port (default: 6000)
-  --listen-host HOST  Bridge listen address (default: 0.0.0.0)
-  --listen-port PORT  Bridge listen port (default: 9023)
-  --verbose, -v       Debug logging
-  --replay PCAPNG     Replay M+ capture directly to laser (diagnostic)
-```
-
----
-
-## Protocol Documentation
-
-See **[PROTOCOL.md](PROTOCOL.md)** for the full specification including packet format, CRC algorithm, command reference, and job sequence.
-
----
-
-## Version History
-
-### v2.4 (in testing)
-- Protocol library extracted to `d1ultra_protocol.py`
-- Pre-job framing via native WORKSPACE command (matches M+ preview behavior)
-- `frame on/off` console toggle, `--no-frame` CLI flag
-
-### v2.3 (current stable)
-- Auto-reconnect after laser idle timeout
-- Job serialization lock (multi-layer jobs queue properly)
-
-### v2.1
-- Fixed ACK feedback loop (unsolicited 0x0013/0x0015 responses no longer flood)
-- PNG preview size matched to ~6KB
-
-### v2.0
-- **Host sends JOB_CONTROL (0x0003)** — the #1 blocker fix
-- Added PRE_JOB, WORKSPACE, QUERY_14 pre-job commands
-- JOB_SETTINGS unknown field corrected to -1.0
-- WORKSPACE 42-byte payload (was 40)
-- PNG preview ~6KB (was 286 bytes)
-- ACK unsolicited laser messages
-- G1 S0 duplicate point filter, 10ms packet pacing
-- Replay mode, full M+ startup sequence, coordinate centering
-
-### v1
-- Initial bridge — connected, uploaded jobs, received ACKs, but jobs never executed
-
----
-
-## Contributing
-
-Contributions are welcome, especially:
-
-- Testing the v2.4 framing feature
-- Adding fill/raster engrave support
-- Improving autofocus reliability
-- Testing with different D1 Ultra firmware versions
-- Improving the RPi Zero JCZ bridge (see `NOTDONE_rpi_zero_bridge/`)
 
 ## How It Was Built
 
